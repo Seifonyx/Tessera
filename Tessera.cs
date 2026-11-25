@@ -30,9 +30,9 @@ using SD = System.Drawing;
 [assembly: AssemblyProduct("Tessera")]
 [assembly: AssemblyDescription("A translucent Start menu that groups your apps into category tiles.")]
 [assembly: AssemblyCopyright("© 2026")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
-[assembly: AssemblyInformationalVersion("1.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1")]
 
 namespace Tessera
 {
@@ -137,9 +137,10 @@ namespace Tessera
 
         // Icons are fetched at exactly the pixel size they're shown at (32 units x your display scaling, e.g. 48 px at
         // 150%), like the real Start menu does. Windows then picks the icon image drawn for that size instead of
-        // us shrinking a different size, which is what made them look soft.
+        // us shrinking a different size, which is what made them look soft. IconUnits follows the tile size setting.
         public static double Scale = 1;
-        public static int IconPx { get { return (int)Math.Round(32 * Scale); } }
+        public static int IconUnits = 32;
+        public static int IconPx { get { return (int)Math.Round(IconUnits * Scale); } }
 
         static ImageSource GetIcon(IShellItem item, int size)
         {
@@ -251,6 +252,65 @@ namespace Tessera
         public bool Changed() { return File.Exists(Path) && File.GetLastWriteTimeUtc(Path) != Stamp; }
     }
 
+    // ---------------------------------------------------------------- settings.ini (changed from the menu: right-click the footer > Settings)
+    public class Settings
+    {
+        public string Path;
+        public int TintAlpha = 0x25;          // how dark the #323232 tint over the blur is (0-255); 0x25 is the theme's own
+        public string TileSize = "Medium";    // Small, Medium or Large
+        public bool ShowTrayIcon;             // off by default: its options are in the footer's right-click menu
+        public bool Shadow = true;            // soft drop shadow under the menu
+
+        public static readonly string[] Sizes = { "Small", "Medium", "Large" };
+
+        public Settings(string path) { Path = path; Load(); if (!File.Exists(path)) Save(); }
+
+        // Icon size in WPF units for each tile size. Icons are fetched at exactly this many pixels x display scaling,
+        // so they stay sharp at every size; tiles, cards and the menu's width scale with it.
+        public int IconUnits { get { return TileSize == "Small" ? 28 : TileSize == "Large" ? 36 : 32; } }
+        public double TileScale { get { return IconUnits / 32.0; } }
+
+        public void Load()
+        {
+            try
+            {
+                if (!File.Exists(Path)) return;
+                foreach (var raw in File.ReadAllLines(Path))
+                {
+                    var line = raw.Trim();
+                    int eq = line.IndexOf('=');
+                    if (line.StartsWith("#") || eq <= 0) continue;
+                    string k = line.Substring(0, eq).Trim(), v = line.Substring(eq + 1).Trim();
+                    int n;
+                    if (k.Equals("TintAlpha", StringComparison.OrdinalIgnoreCase) && int.TryParse(v, out n)) TintAlpha = Math.Max(0, Math.Min(255, n));
+                    else if (k.Equals("TileSize", StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (var s in Sizes) if (s.Equals(v, StringComparison.OrdinalIgnoreCase)) TileSize = s;
+                    }
+                    else if (k.Equals("ShowTrayIcon", StringComparison.OrdinalIgnoreCase)) ShowTrayIcon = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase);
+                    else if (k.Equals("Shadow", StringComparison.OrdinalIgnoreCase)) Shadow = !(v == "0" || v.Equals("false", StringComparison.OrdinalIgnoreCase));
+                }
+            }
+            catch { }
+        }
+
+        public void Save()
+        {
+            try
+            {
+                File.WriteAllText(Path,
+                    "# Tessera settings. Changed from the menu: right-click the footer > Settings.\r\n" +
+                    "# TintAlpha: how dark the glass is, 0-255 (37 is the TranslucentStartMenu theme's tint)\r\n" +
+                    "# TileSize: Small, Medium or Large\r\n" +
+                    "# ShowTrayIcon: 1 shows Tessera's icon in the notification area\r\n" +
+                    "# Shadow: 1 draws a soft shadow under the menu, 0 turns it off\r\n" +
+                    "TintAlpha=" + TintAlpha + "\r\nTileSize=" + TileSize + "\r\nShowTrayIcon=" + (ShowTrayIcon ? "1" : "0") +
+                    "\r\nShadow=" + (Shadow ? "1" : "0") + "\r\n");
+            }
+            catch { }
+        }
+    }
+
     // ---------------------------------------------------------------- keyboard / mouse hooks (own thread, so a busy UI never lags input)
     static class Hooks
     {
@@ -279,7 +339,7 @@ namespace Tessera
         [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
         static Rect startRect = Rect.Empty;
         public static volatile bool Enabled = true;
-        public static Action Toggle;
+        public static Action<bool> Toggle;   // true: from the keyboard (Win, Ctrl+Esc), false: a Start button click
 
         public static bool Running { get { return threadId != 0; } }
         static bool watching;
@@ -342,7 +402,7 @@ namespace Tessera
                     {
                         if (down && (escHeld || ((GetAsyncKeyState(0x11) & 0x8000) != 0 && (GetAsyncKeyState(0x10) & 0x8000) == 0 && (GetAsyncKeyState(0x12) & 0x8000) == 0)))
                         {
-                            if (!escHeld) { escHeld = true; if (Toggle != null) Toggle(); }   // ignore key-repeat
+                            if (!escHeld) { escHeld = true; if (Toggle != null) Toggle(true); }   // ignore key-repeat
                             return (IntPtr)1;
                         }
                         if (up && escHeld) { escHeld = false; return (IntPtr)1; }
@@ -357,7 +417,7 @@ namespace Tessera
                             {
                                 // Win pressed alone: hide it from Windows (mask key in between) so the normal Start stays closed
                                 Send(Key(0xE8, false), Key(0xE8, true), Key((ushort)k.vk, true));
-                                if (Toggle != null) Toggle();
+                                if (Toggle != null) Toggle(true);
                                 return (IntPtr)1;
                             }
                         }
@@ -381,7 +441,7 @@ namespace Tessera
                         if (msg == 0x201 && !startRect.IsEmpty && startRect.Contains(m.x, m.y))
                         {
                             swallowUp = true;
-                            if (Toggle != null) Toggle();
+                            if (Toggle != null) Toggle(false);
                             return (IntPtr)1;
                         }
                         if (msg == 0x202 && swallowUp) { swallowUp = false; return (IntPtr)1; }
@@ -436,6 +496,147 @@ namespace Tessera
         }
     }
 
+    // ---------------------------------------------------------------- soft drop shadow
+    // The menu window can't draw its own shadow: it isn't layered (for speed) and SetWindowRgn clips everything outside
+    // its rounded corners. So the shadow is a separate click-through layered window kept just behind the menu. Its
+    // picture is drawn once per menu size, and moving it costs DWM nothing. It has its own thread and message loop, so
+    // moving it from the slide thread never waits on the (sometimes busy) UI thread.
+    sealed class ShadowWindow
+    {
+        delegate IntPtr WndProc(IntPtr h, uint m, IntPtr w, IntPtr l);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct WNDCLASSEX
+        {
+            public int cbSize; public uint style; public WndProc lpfnWndProc; public int cbClsExtra, cbWndExtra;
+            public IntPtr hInstance, hIcon, hCursor, hbrBackground; public string lpszMenuName, lpszClassName; public IntPtr hIconSm;
+        }
+        [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr hwnd; public uint message; public IntPtr w, l; public uint time; public int x, y; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct BITMAPINFOHEADER { public int biSize, biWidth, biHeight; public short biPlanes, biBitCount; public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant; }
+        [StructLayout(LayoutKind.Sequential)] struct SIZE { public int cx, cy; }
+        [StructLayout(LayoutKind.Sequential)] struct POINT { public int x, y; }
+        [StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLENDFUNCTION { public byte op, flags, alpha, format; }
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern ushort RegisterClassEx(ref WNDCLASSEX c);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr CreateWindowEx(int ex, string cls, string title, int style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
+        [DllImport("user32.dll")] static extern IntPtr DefWindowProc(IntPtr h, uint m, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr h, uint a, uint b);
+        [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG m);
+        [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG m);
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+        [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+        [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+        [DllImport("user32.dll")]
+        static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dst, IntPtr pptDst, ref SIZE size, IntPtr src, ref POINT ptSrc, int key, ref BLENDFUNCTION bf, int flags);
+        [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+        [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+        [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr o);
+        [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+        [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr dc, ref BITMAPINFOHEADER bi, uint usage, out IntPtr bits, IntPtr sec, uint off);
+        [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string n);
+
+        public IntPtr Hwnd;
+        WndProc proc;   // kept referenced so it isn't garbage-collected
+        readonly object gate = new object();
+        byte[] pending; int pendW, pendH;
+        bool shown;
+        const uint WM_APP_IMAGE = 0x8001;
+
+        public ShadowWindow()
+        {
+            var ready = new ManualResetEvent(false);
+            var t = new Thread(() =>
+            {
+                proc = (h, m, w, l) => DefWindowProc(h, m, w, l);
+                var wc = new WNDCLASSEX { cbSize = Marshal.SizeOf(typeof(WNDCLASSEX)), lpfnWndProc = proc, hInstance = GetModuleHandle(null), lpszClassName = "Tessera.Shadow" };
+                RegisterClassEx(ref wc);
+                // layered + transparent: per-pixel alpha, and clicks go straight through it. Topmost tool window that
+                // is never activated: not in Alt+Tab, never takes focus. No title, so the Windhawk mod can't mistake it.
+                Hwnd = CreateWindowEx(0x80000 | 0x20 | 0x80 | 0x8000000 | 0x8, "Tessera.Shadow", null, unchecked((int)0x80000000),
+                    -30000, -30000, 1, 1, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
+                ready.Set();
+                MSG msg;
+                while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+                {
+                    if (msg.message == WM_APP_IMAGE) { Apply(); continue; }
+                    TranslateMessage(ref msg); DispatchMessage(ref msg);
+                }
+            });
+            t.IsBackground = true; t.Name = "shadow"; t.Start();
+            ready.WaitOne(2000);
+        }
+
+        public void SetImage(byte[] px, int w, int h)
+        {
+            lock (gate) { pending = px; pendW = w; pendH = h; }
+            if (Hwnd != IntPtr.Zero) PostMessage(Hwnd, WM_APP_IMAGE, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        void Apply()
+        {
+            byte[] px; int w, h;
+            lock (gate) { px = pending; w = pendW; h = pendH; pending = null; }
+            if (px == null) return;
+            var bi = new BITMAPINFOHEADER { biSize = 40, biWidth = w, biHeight = -h, biPlanes = 1, biBitCount = 32 };
+            IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen), bits;
+            IntPtr bmp = CreateDIBSection(screen, ref bi, 0, out bits, IntPtr.Zero, 0);
+            if (bmp != IntPtr.Zero)
+            {
+                Marshal.Copy(px, 0, bits, px.Length);
+                IntPtr old = SelectObject(mem, bmp);
+                var size = new SIZE { cx = w, cy = h }; var src = new POINT();
+                var bf = new BLENDFUNCTION { op = 0, flags = 0, alpha = 255, format = 1 };   // AC_SRC_OVER, per-pixel alpha
+                UpdateLayeredWindow(Hwnd, screen, IntPtr.Zero, ref size, mem, ref src, 0, ref bf, 2);   // ULW_ALPHA, keeps its position
+                SelectObject(mem, old); DeleteObject(bmp);
+            }
+            DeleteDC(mem); ReleaseDC(IntPtr.Zero, screen);
+            if (!shown) { shown = true; ShowWindow(Hwnd, 4); }   // SW_SHOWNOACTIVATE
+        }
+
+        // The shadow of a w x h pixel rounded rectangle (corner radius r), in a picture m pixels larger on every side.
+        // Two layers, like Windows 11's own flyouts: a wide soft one and a tight one near the edge, both slightly lower
+        // than the menu. Nothing is drawn under the menu itself, or its glass would blur the shadow in.
+        public static byte[] Picture(int w, int h, double r, int m, double scale)
+        {
+            int pw = w + 2 * m, ph = h + 2 * m;
+            var px = new byte[pw * ph * 4];
+            double cx = m + w / 2.0, cy = m + h / 2.0, hx = w / 2.0, hy = h / 2.0;
+            double s1 = 14 * scale, o1 = 8 * scale, a1 = 0.28;    // wide and soft
+            double s2 = 2.5 * scale, o2 = 1.5 * scale, a2 = 0.14; // tight, just around the edge
+            for (int y = 0; y < ph; y++)
+                for (int x = 0; x < pw; x++)
+                {
+                    double dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+                    double inside = RoundRect(dx, dy, hx, hy, r);
+                    if (inside <= 0) continue;
+                    double v1 = a1 * Cover(RoundRect(dx, dy - o1, hx, hy, r), s1);
+                    double v2 = a2 * Cover(RoundRect(dx, dy - o2, hx, hy, r), s2);
+                    double a = (1 - (1 - v1) * (1 - v2)) * Math.Min(1, inside);
+                    px[(y * pw + x) * 4 + 3] = (byte)Math.Round(a * 255);   // black, so premultiplied colour stays 0
+                }
+            return px;
+        }
+
+        // signed distance from a point to a rounded rectangle centred on 0,0 (negative inside)
+        static double RoundRect(double x, double y, double hx, double hy, double r)
+        {
+            double qx = Math.Abs(x) - hx + r, qy = Math.Abs(y) - hy + r;
+            double ox = Math.Max(qx, 0), oy = Math.Max(qy, 0);
+            return Math.Sqrt(ox * ox + oy * oy) + Math.Min(Math.Max(qx, qy), 0) - r;
+        }
+
+        // how much of a blurred edge's darkness reaches distance d outside it (1 well inside, 0.5 on the edge)
+        static double Cover(double d, double sigma) { return 0.5 * Erfc(d / (sigma * 1.41421356)); }
+
+        static double Erfc(double x)
+        {   // Abramowitz & Stegun 7.1.26
+            double z = Math.Abs(x), t = 1 / (1 + 0.3275911 * z);
+            double y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429)))) * Math.Exp(-z * z);
+            return x >= 0 ? y : 2 - y;
+        }
+    }
+
     // ---------------------------------------------------------------- the menu window
     public class StartWindow : Window
     {
@@ -452,11 +653,34 @@ namespace Tessera
         [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
         [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int l, t, r, b; }
+        [StructLayout(LayoutKind.Sequential)] struct POINT { public int x, y; }
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public uint dwFlags; }
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO mi);
+        [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+        [DllImport("user32.dll")] static extern IntPtr BeginDeferWindowPos(int n);
+        [DllImport("user32.dll")] static extern IntPtr DeferWindowPos(IntPtr d, IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] static extern bool EndDeferWindowPos(IntPtr d);
 
         public Config Cfg;
+        public Settings Set;
+        // set by Program: the options that used to be on the tray icon's menu
+        public Func<bool> GetTakeover;
+        public Action<bool> SetTakeover, ShowTray;
+        public Action ExitApp;
+        ShadowWindow shadow;
+        volatile int shadowM;   // how far the shadow picture reaches past the menu on each side, in pixels
+        Border tintLayer;
+        IntPtr curMon;                  // the monitor the menu opens on (zero until the first open: the primary one)
+        volatile IntPtr slideTray;      // that monitor's taskbar, when it isn't the main one
         List<AppEntry> apps = new List<AppEntry>();
         DateTime lastScan;
-        bool scanning;
+        bool scanning, rescanFresh;
         IntPtr hwnd;
         Grid content;
         TextBox search;
@@ -517,16 +741,17 @@ namespace Tessera
         static readonly Color Rest = C("#00FFFFFF"), Over = C("#1FFFFFFF"), Press = C("#14FFFFFF"),
             CardRest = C("#14FFFFFF"), CardOver = C("#26FFFFFF"), TileRest = C("#0DFFFFFF"), TileOver = C("#22FFFFFF");
         static readonly Brush Frost = B("#33FFFFFF"), FrostLine = B("#29FFFFFF");
-        const string Tint = "#25323232";   // TranslucentStartMenu's CommonBgBrush tint
+        // TranslucentStartMenu's CommonBgBrush tint is #25323232; the alpha comes from the Tint strength setting
+        static Brush TintBrush(int alpha) { var b = new SolidColorBrush(Color.FromArgb((byte)alpha, 0x32, 0x32, 0x32)); b.Freeze(); return b; }
         static readonly FontFamily IconFont = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets");
 
-        public StartWindow(Config cfg)
+        public StartWindow(Config cfg, Settings set)
         {
-            Cfg = cfg;
+            Cfg = cfg; Set = set;
             Title = "Tessera";   // the Windhawk mod finds this window by its title and class
             // Not a "layered" window: WPF draws straight to the GPU instead of copying every frame through the CPU
             WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize;
-            ShowInTaskbar = false; Topmost = true; Width = W; Height = H;
+            ShowInTaskbar = false; Topmost = true; Width = W * Set.TileScale; Height = H;
             Background = Brushes.Transparent; Foreground = Fg;
             UseLayoutRounding = true;   // keep icons and text on whole pixels (half-pixel positions look smeared)
             FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI");
@@ -557,6 +782,7 @@ namespace Tessera
             BuildHome(); host.Content = homeView;
             Show(); UpdateLayout();
             ShowActivated = true;
+            shadow = new ShadowWindow();
             // It stays "shown" but parked just off the bottom of the screen, so opening it is only the slide
             // (no window has to be created or re-shown, which is what used to cost a noticeable moment)
             Geometry(); Park();
@@ -590,20 +816,30 @@ namespace Tessera
             finally { Marshal.FreeHGlobal(p); }
         }
 
-        // Where the menu sits when open: centred above the taskbar, like Windows 11
+        // Where the menu sits when open: centred above the taskbar, like Windows 11. On the main monitor that's the
+        // usual work area; on another monitor (see PickMonitor) it's centred above that monitor's taskbar instead.
         void Geometry()
         {
+            var src = PresentationSource.FromVisual(this);
+            if (src != null) scale = src.CompositionTarget.TransformToDevice.M11;
             var wa = SystemParameters.WorkArea;
-            double h = Math.Min(H, wa.Height - 2 * Gap), w = Math.Min(W, wa.Width - 2 * Gap);
+            IntPtr tray = IntPtr.Zero;   // zero: slide out from behind the main taskbar (found afresh every frame)
+            var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+            if (curMon != IntPtr.Zero && GetMonitorInfo(curMon, ref mi) && (mi.dwFlags & 1) == 0)   // not MONITORINFOF_PRIMARY
+            {
+                wa = new Rect(mi.rcWork.l / scale, mi.rcWork.t / scale, (mi.rcWork.r - mi.rcWork.l) / scale, (mi.rcWork.b - mi.rcWork.t) / scale);
+                tray = TaskbarOn(curMon);
+            }
+            slideTray = tray;
+            double h = Math.Min(H, wa.Height - 2 * Gap), w = Math.Min(W * Set.TileScale, wa.Width - 2 * Gap);
             if (h != Height || w != Width) { Height = h; Width = w; }
             double left = wa.Left + (wa.Width - Width) / 2;   // applied by our own moves (setting WPF's Left would force extra work)
             finalTop = wa.Bottom - Height - Gap;
-            var src = PresentationSource.FromVisual(this);
-            if (src != null) scale = src.CompositionTarget.TransformToDevice.M11;
             pxLeft = (int)Math.Round(left * scale);
             pxFinalTop = (int)Math.Round(finalTop * scale);
             pxTravel = (int)Math.Round((wa.Bottom - finalTop) * scale);           // fully behind the taskbar
-            pxHidden = (int)Math.Round(SystemParameters.PrimaryScreenHeight * scale) + 4;   // fully off-screen
+            // fully off-screen: below the lowest monitor (with one monitor that's just below the screen)
+            pxHidden = (int)Math.Round((SystemParameters.VirtualScreenTop + SystemParameters.VirtualScreenHeight) * scale) + 4;
             if (hwnd != IntPtr.Zero)
             {   // rounded corners (clips the blur too); only re-applied when the size changes, because applying it
                 // forces a full redraw
@@ -612,10 +848,98 @@ namespace Tessera
                 {
                     rgnW = pw; rgnH = ph;
                     SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, pw + 1, ph + 1, r, r), true);
+                    UpdateShadow(pw, ph);
                 }
             }
         }
         int rgnW, rgnH;
+
+        // The shadow's picture for a menu of pw x ph pixels, drawn on a side thread (it takes a few tens of ms)
+        void UpdateShadow(int pw, int ph)
+        {
+            if (shadow == null) return;
+            int m = (int)Math.Round(44 * scale);
+            double rr = Radius * scale, sc = scale;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                var px = ShadowWindow.Picture(pw, ph, rr, m, sc);
+                shadowM = m;
+                shadow.SetImage(px, pw + 2 * m, ph + 2 * m);
+                Dispatcher.BeginInvoke(new Action(() =>
+                {   // put it where the menu is now (the slide moves it anyway while sliding)
+                    if (aActive) return;
+                    RECT r; GetWindowRect(hwnd, out r);
+                    MoveTo(IntPtr.Zero, r.l, r.t, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }));
+            });
+        }
+
+        static string ClassOf(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return "";
+            var sb = new StringBuilder(64); GetClassName(h, sb, 64); return sb.ToString();
+        }
+
+        // The taskbar shown on a given monitor that isn't the main one (Windows calls those Shell_SecondaryTrayWnd)
+        static IntPtr TaskbarOn(IntPtr mon)
+        {
+            IntPtr h = IntPtr.Zero;
+            while ((h = FindWindowEx(IntPtr.Zero, h, "Shell_SecondaryTrayWnd", null)) != IntPtr.Zero)
+                if (MonitorFromWindow(h, 2) == mon) return h;
+            return IntPtr.Zero;
+        }
+
+        // Which monitor to open on: for a Start button click, the monitor of the taskbar under the pointer; for the
+        // keyboard, the monitor of the window you're working in. With one monitor this is always the main one.
+        IntPtr PickMonitor(bool keyboard)
+        {
+            POINT pt; GetCursorPos(out pt);
+            if (!keyboard)
+            {   // taskbar rectangles, not WindowFromPoint: that one has to ask windows (and so can wait on them)
+                IntPtr t = FindWindow("Shell_TrayWnd", null);
+                if (t != IntPtr.Zero && Under(t, pt)) return MonitorFromPoint(pt, 2);
+                t = IntPtr.Zero;
+                while ((t = FindWindowEx(IntPtr.Zero, t, "Shell_SecondaryTrayWnd", null)) != IntPtr.Zero)
+                    if (Under(t, pt)) return MonitorFromPoint(pt, 2);
+            }
+            IntPtr fg = GetForegroundWindow();
+            if (fg == hwnd) return curMon;
+            string c = ClassOf(fg);
+            if (fg == IntPtr.Zero || c == "Progman" || c == "WorkerW") return MonitorFromPoint(pt, 2);   // the desktop spans every monitor
+            return MonitorFromWindow(fg, 2);   // MONITOR_DEFAULTTONEAREST
+        }
+
+        static bool Under(IntPtr h, POINT pt)
+        {
+            RECT r; return GetWindowRect(h, out r) && pt.x >= r.l && pt.x < r.r && pt.y >= r.t && pt.y < r.b;
+        }
+
+        // Moves the menu and its shadow together, in one step so the shadow never lags a frame behind. Measured
+        // (tools/measure-slide.ps1 and an in-app frame log): no difference to the slide with or without the shadow.
+        void MoveTo(IntPtr after, int x, int y, uint flags) { MoveTo(after, x, y, flags, y); }
+
+        // shadowY: where the shadow goes (pxHidden parks it while the menu itself stays put)
+        void MoveTo(IntPtr after, int x, int y, uint flags, int shadowY)
+        {
+            IntPtr sh = shadow != null && Set.Shadow ? shadow.Hwnd : IntPtr.Zero;
+            int m = shadowM;
+            if (sh == IntPtr.Zero) { SetWindowPos(hwnd, after, x, y, 0, 0, flags); return; }
+            IntPtr d = BeginDeferWindowPos(2);
+            if (d != IntPtr.Zero) d = DeferWindowPos(d, hwnd, after, x, y, 0, 0, flags);
+            if (d != IntPtr.Zero) d = DeferWindowPos(d, sh, hwnd, x - m, shadowY - m, 0, 0, flags);   // just behind the menu
+            if (d != IntPtr.Zero && EndDeferWindowPos(d)) return;
+            SetWindowPos(hwnd, after, x, y, 0, 0, flags);
+            SetWindowPos(sh, hwnd, x - m, shadowY - m, 0, 0, flags);
+        }
+
+        // Settings > Shadow
+        void SetShadow(bool on)
+        {
+            Set.Shadow = on; Set.Save();
+            if (shadow == null || shadow.Hwnd == IntPtr.Zero) return;
+            if (!on) SetWindowPos(shadow.Hwnd, IntPtr.Zero, -30000, -30000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            else if (!aActive) { RECT r; GetWindowRect(hwnd, out r); MoveTo(IntPtr.Zero, r.l, r.t, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE); }
+        }
 
         // While sliding, WPF doesn't need to hear about each move; skipping its bookkeeping keeps every frame on time
         IntPtr MoveFilter(IntPtr h, int msg, IntPtr w, IntPtr l, ref bool handled)
@@ -641,7 +965,7 @@ namespace Tessera
         {
             lock (animLock) { aActive = false; aDone = null; slideNow = 1; }
             parked = true;
-            if (hwnd != IntPtr.Zero) SetWindowPos(hwnd, IntPtr.Zero, pxLeft, pxHidden, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            if (hwnd != IntPtr.Zero) MoveTo(IntPtr.Zero, pxLeft, pxHidden, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
         bool parked;
 
@@ -678,22 +1002,29 @@ namespace Tessera
                         finished = t >= 1;
                         if (finished) { aActive = false; done = aDone; aDone = null; }
                     }
-                    IntPtr tray = FindWindow("Shell_TrayWnd", null);
+                    IntPtr st = slideTray;
+                    IntPtr tray = st != IntPtr.Zero ? st : FindWindow("Shell_TrayWnd", null);
                     trayHwnd = tray;
-                    SetWindowPos(hwnd, tray != IntPtr.Zero ? tray : new IntPtr(-1), pxLeft, pxFinalTop + (int)Math.Round(s * pxTravel), 0, 0,
-                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                    int y = pxFinalTop + (int)Math.Round(s * pxTravel);
+                    // fully closed: the menu is behind the taskbar, but the top of its shadow would still show above
+                    // it until the menu is parked, so the shadow goes away in this same frame
+                    MoveTo(tray != IntPtr.Zero ? tray : new IntPtr(-1), pxLeft, y, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                        finished && s >= 1 ? pxHidden : y);
                     if (finished) { if (done != null) Dispatcher.BeginInvoke(done); break; }
                 }
             }
         }
 
         // ------------------------------------------------ data
-        void Scan(bool background)
+        void Scan(bool background) { Scan(background, false); }
+
+        // fresh: fetch every icon again (after the tile size, and so the icon size, changed)
+        void Scan(bool background, bool fresh)
         {
-            if (scanning) return;
+            if (scanning) { if (fresh) rescanFresh = true; return; }
             scanning = true;
             var cache = new Dictionary<string, ImageSource>();
-            foreach (var a in apps) if (a.Icon != null && !cache.ContainsKey(a.Id)) cache[a.Id] = a.Icon;
+            if (!fresh) foreach (var a in apps) if (a.Icon != null && !cache.ContainsKey(a.Id)) cache[a.Id] = a.Icon;
             var t = new Thread(() =>
             {
                 List<AppEntry> list;
@@ -702,6 +1033,7 @@ namespace Tessera
                 {
                     if (list != null && list.Count > 0) { var old = apps; apps = list; Shell.Free(old); homeDirty = true; }
                     lastScan = DateTime.Now; scanning = false;
+                    if (rescanFresh) { rescanFresh = false; Scan(true, true); }
                 };
                 if (background) Dispatcher.BeginInvoke(done); else done();
             });
@@ -755,13 +1087,17 @@ namespace Tessera
         // Clicking the taskbar Start button while the menu is open first takes focus away (which closes the menu), and only
         // then does explorer ask to open Start. Without this, that click would close the menu and immediately reopen it.
         DateTime autoHidAt = DateTime.MinValue;
-        public void Toggle()
+        public void Toggle() { Toggle(false); }   // the Windhawk mod's requests: Start button clicks
+
+        public void Toggle(bool keyboard)
         {
             if (IsOpen) HideMenu(true);
-            else if ((DateTime.UtcNow - autoHidAt).TotalMilliseconds > 400) ShowMenu();
+            else if ((DateTime.UtcNow - autoHidAt).TotalMilliseconds > 400) ShowMenu(keyboard);
         }
 
-        public void ShowMenu()
+        public void ShowMenu() { ShowMenu(true); }
+
+        void ShowMenu(bool keyboard)
         {
             if (IsOpen) return;
             IsOpen = true;
@@ -769,6 +1105,7 @@ namespace Tessera
             if (before != hwnd) prevFg = before;   // where the keyboard goes back to if the menu is closed without opening anything
             if (parked || !IsVisible)
             {
+                curMon = PickMonitor(keyboard);
                 if (Cfg.Changed()) { Cfg.Load(); homeDirty = true; }
                 if (search.Text.Length > 0) search.Text = "";
                 if (view != "home" || homeDirty) ShowHome();
@@ -804,7 +1141,12 @@ namespace Tessera
             if (SetForegroundWindow(hwnd) && GetForegroundWindow() == hwnd) return;
             uint pid;
             uint fg = GetWindowThreadProcessId(GetForegroundWindow(), out pid), me = GetCurrentThreadId();
-            if (fg != me) { AttachThreadInput(me, fg, true); SetForegroundWindow(hwnd); BringWindowToTop(hwnd); AttachThreadInput(me, fg, false); }
+            if (fg == me) return;
+            // attaching and detaching the input queues sends this window a deactivate in passing; without
+            // SuppressHide that closed the menu again straight away (while it kept the keyboard)
+            bool was = SuppressHide; SuppressHide = true;
+            try { AttachThreadInput(me, fg, true); SetForegroundWindow(hwnd); BringWindowToTop(hwnd); AttachThreadInput(me, fg, false); }
+            finally { SuppressHide = was; }
         }
 
         public static void Log(string m) { try { File.AppendAllText(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug.log"), DateTime.Now.ToString("HH:mm:ss.fff ") + m + "\r\n"); } catch { } }
@@ -853,7 +1195,9 @@ namespace Tessera
             var root = new Grid();
             // the blur comes from Windows (see InitNative); this lays the TranslucentStartMenu tint (#25323232) over it.
             // No edge line, like the theme (BorderThickness=0).
-            root.Children.Add(new Border { Background = B(Tint), CornerRadius = new CornerRadius(Radius) });
+            // Its strength is the Tint strength setting (TintAlpha in settings.ini).
+            tintLayer = new Border { Background = TintBrush(Set.TintAlpha), CornerRadius = new CornerRadius(Radius) };
+            root.Children.Add(tintLayer);
             content = new Grid();
             content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             content.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
@@ -884,7 +1228,9 @@ namespace Tessera
             // footer
             // footer: darker strip with your account on the left and power on the right, as in Windows 11
             // footer: same glass as the rest (no darker band, as in the theme); account button left, power right
-            var ft = new Border { Height = 68, Padding = new Thickness(Pad + 4, 0, Pad + 4, 0) };
+            // right-click anywhere on it: Settings, Edit categories, the takeover switch, About, Exit
+            var ft = new Border { Height = 68, Padding = new Thickness(Pad + 4, 0, Pad + 4, 0), Background = Clear };
+            ft.ContextMenu = FooterMenu();
             var fg = new Grid();
             var user = new Border { CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 6, 14, 6),
                 BorderBrush = FrostLine, BorderThickness = new Thickness(1),
@@ -1071,9 +1417,10 @@ namespace Tessera
         // App with its name underneath (pinned row, category pages)
         Border Tile(AppEntry a)
         {
-            var b = new Border { Width = 98, Height = 84, Margin = new Thickness(2), CornerRadius = new CornerRadius(6), ToolTip = a.Name };
+            double f = Set.TileScale;
+            var b = new Border { Width = Math.Round(98 * f), Height = Math.Round(84 * f), Margin = new Thickness(2), CornerRadius = new CornerRadius(6), ToolTip = a.Name };
             var sp = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            var ic = Icon(a, 32); ic.Margin = new Thickness(0, 0, 0, 9);
+            var ic = Icon(a, Set.IconUnits); ic.Margin = new Thickness(0, 0, 0, 9);
             sp.Children.Add(ic);
             sp.Children.Add(new TextBlock { Text = a.Name, FontSize = 12, Foreground = Fg, TextAlignment = TextAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, Margin = new Thickness(6, 0, 6, 0) });
             b.Child = sp;
@@ -1086,16 +1433,17 @@ namespace Tessera
         // Category card: 3 big icons + a mini grid of more, name and count underneath
         Border Card(string name, List<AppEntry> list)
         {
-            var card = new Border { Width = 196, Margin = new Thickness(4), Padding = new Thickness(10, 10, 10, 10), CornerRadius = new CornerRadius(8),
+            double f = Set.TileScale;
+            var card = new Border { Width = Math.Round(196 * f), Margin = new Thickness(4), Padding = new Thickness(10, 10, 10, 10), CornerRadius = new CornerRadius(8),
                 BorderBrush = FrostLine, BorderThickness = new Thickness(1) };
             var sp = new StackPanel();
-            var row = new UniformGrid { Rows = 1, Columns = 4, Height = 44 };
+            var row = new UniformGrid { Rows = 1, Columns = 4, Height = Math.Round(44 * f) };
             int big = list.Count <= 4 ? Math.Min(4, list.Count) : 3;
             for (int i = 0; i < big; i++)
             {
                 var a = list[i];
                 var cell = new Border { CornerRadius = new CornerRadius(4), ToolTip = a.Name, Margin = new Thickness(1) };
-                cell.Child = Icon(a, 32);
+                cell.Child = Icon(a, Set.IconUnits);
                 Hover(cell, Rest, C("#2EFFFFFF"));
                 cell.MouseLeftButtonUp += (s, e) => { e.Handled = true; Run(a, false); };
                 cell.ContextMenu = AppMenu(a);
@@ -1103,8 +1451,8 @@ namespace Tessera
             }
             if (list.Count > 4)
             {
-                var mini = new UniformGrid { Rows = 2, Columns = 2, Width = 38, Height = 38, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-                for (int i = 3; i < Math.Min(7, list.Count); i++) { var m = Icon(list[i], 15); m.Margin = new Thickness(2); mini.Children.Add(m); }
+                var mini = new UniformGrid { Rows = 2, Columns = 2, Width = Math.Round(38 * f), Height = Math.Round(38 * f), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+                for (int i = 3; i < Math.Min(7, list.Count); i++) { var m = Icon(list[i], Math.Round(15 * f)); m.Margin = new Thickness(2); mini.Children.Add(m); }
                 var mb = new Border { CornerRadius = new CornerRadius(4), Background = B("#0DFFFFFF"), Margin = new Thickness(3), Child = mini, ToolTip = "Show all " + list.Count };
                 row.Children.Add(mb);
             }
@@ -1155,6 +1503,14 @@ namespace Tessera
         {
             bool fromHome = view == "home";
             view = "cat"; viewCat = name; viewList = list;
+            var wp = new WrapPanel { Margin = new Thickness(Pad - 4, 0, Pad - 10, 12) };
+            foreach (var a in list) wp.Children.Add(Tile(a));
+            SetPage(PageGrid(name, list.Count + " apps", wp), fromHome ? 1 : 0);
+        }
+
+        // A page with a back button and a title (category pages, Settings, About)
+        Grid PageGrid(string title, string sub, UIElement body)
+        {
             var g = new Grid();
             g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
@@ -1162,13 +1518,191 @@ namespace Tessera
             var back = IconButton("", "Back (Esc)", true, () => ShowHome(-1));
             back.Width = 34; back.Height = 34;
             hd.Children.Add(back);
-            hd.Children.Add(new TextBlock { Text = name, FontSize = 20, FontWeight = FontWeights.SemiBold, Margin = new Thickness(8, 0, 0, 2), VerticalAlignment = VerticalAlignment.Center });
-            hd.Children.Add(new TextBlock { Text = list.Count + " apps", FontSize = 12, Foreground = Fg3, Margin = new Thickness(12, 4, 0, 0), VerticalAlignment = VerticalAlignment.Center });
+            hd.Children.Add(new TextBlock { Text = title, FontSize = 20, FontWeight = FontWeights.SemiBold, Margin = new Thickness(8, 0, 0, 2), VerticalAlignment = VerticalAlignment.Center });
+            if (sub != null)
+                hd.Children.Add(new TextBlock { Text = sub, FontSize = 12, Foreground = Fg3, Margin = new Thickness(12, 4, 0, 0), VerticalAlignment = VerticalAlignment.Center });
             g.Children.Add(hd);
-            var wp = new WrapPanel { Margin = new Thickness(Pad - 4, 0, Pad - 10, 12) };
-            foreach (var a in list) wp.Children.Add(Tile(a));
-            var sv = Scroll(wp); Grid.SetRow(sv, 1); g.Children.Add(sv);
-            SetPage(g, fromHome ? 1 : 0);
+            var sv = Scroll(body); Grid.SetRow(sv, 1); g.Children.Add(sv);
+            return g;
+        }
+
+        // ------------------------------------------------ Settings and About pages (from the footer's right-click menu)
+        public void ShowSettings()
+        {
+            bool fromHome = view == "home";
+            view = "settings";
+            var sp = new StackPanel { Margin = new Thickness(Pad - 2, 0, Pad, 12) };
+
+            var val = new TextBlock { FontSize = 12, Foreground = Fg2, VerticalAlignment = VerticalAlignment.Center };
+            var slider = new Slider { Minimum = 0, Maximum = 153, Value = Set.TintAlpha, IsMoveToPointEnabled = true, SmallChange = 3, LargeChange = 13,
+                Focusable = false, Margin = new Thickness(0, 12, 0, 0) };
+            Action showVal = () => { val.Text = Math.Round(slider.Value / 2.55) + "%"; };
+            showVal();
+            slider.ValueChanged += (s, e) =>
+            {
+                Set.TintAlpha = (int)Math.Round(slider.Value);
+                tintLayer.Background = TintBrush(Set.TintAlpha);
+                showVal(); SaveSoon();
+            };
+            sp.Children.Add(Group("Tint strength", "How dark the glass is. 15% matches the TranslucentStartMenu theme.", val, slider));
+
+            var sizes = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
+            foreach (var size in Settings.Sizes)
+            {
+                var name = size;
+                sizes.Children.Add(Choice(name, Set.TileSize == name, () => { SetTileSize(name); ShowSettings(); }));
+            }
+            sp.Children.Add(Group("Tile size", "Size of the app tiles and category cards. The menu gets wider or narrower to match.", null, sizes));
+
+            var shade = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
+            foreach (var on in new[] { false, true })
+            {
+                bool v = on;
+                shade.Children.Add(Choice(v ? "On" : "Off", Set.Shadow == v, () => { SetShadow(v); ShowSettings(); }));
+            }
+            sp.Children.Add(Group("Shadow", "A soft shadow around the menu, like Windows' own Start.", null, shade));
+
+            var tray = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
+            foreach (var on in new[] { false, true })
+            {
+                bool v = on;
+                tray.Children.Add(Choice(v ? "Shown" : "Hidden", Set.ShowTrayIcon == v, () =>
+                {
+                    Set.ShowTrayIcon = v; Set.Save();
+                    if (ShowTray != null) ShowTray(v);
+                    ShowSettings();
+                }));
+            }
+            sp.Children.Add(Group("Tray icon", "Tessera's icon in the notification area. Everything it offered is also on the footer's right-click menu.", null, tray));
+
+            sp.Children.Add(new TextBlock { Text = "Saved in settings.ini next to Tessera.exe.", FontSize = 12, Foreground = Fg3, Margin = new Thickness(8, 2, 0, 0) });
+            SetPage(PageGrid("Settings", null, sp), fromHome ? 1 : 0);
+        }
+
+        // A frosted settings card: title (and something on its right), a line of explanation, then the control
+        Border Group(string title, string desc, FrameworkElement right, UIElement body)
+        {
+            var b = new Border { CornerRadius = new CornerRadius(8), BorderBrush = FrostLine, BorderThickness = new Thickness(1), Background = new SolidColorBrush(CardRest),
+                Padding = new Thickness(16, 13, 16, 15), Margin = new Thickness(4, 0, 4, 10) };
+            var sp = new StackPanel();
+            var top = new Grid();
+            top.Children.Add(new TextBlock { Text = title, FontSize = 14, FontWeight = FontWeights.SemiBold, FontFamily = new FontFamily("Segoe UI Variable Display, Segoe UI") });
+            if (right != null) { right.HorizontalAlignment = HorizontalAlignment.Right; top.Children.Add(right); }
+            sp.Children.Add(top);
+            sp.Children.Add(new TextBlock { Text = desc, FontSize = 12, Foreground = Fg3, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 3, 0, 0) });
+            sp.Children.Add(body);
+            b.Child = sp;
+            return b;
+        }
+
+        // One option in a row of choices; the chosen one has an accent outline
+        Border Choice(string text, bool chosen, Action click)
+        {
+            var b = new Border { CornerRadius = new CornerRadius(6), Padding = new Thickness(16, 6, 16, 7), Margin = new Thickness(0, 0, 6, 0),
+                BorderThickness = new Thickness(1), BorderBrush = chosen ? Accent : FrostLine, Child = new TextBlock { Text = text, FontSize = 12.5 } };
+            if (chosen) b.Background = B("#26FFFFFF");
+            else { Hover(b, TileRest, TileOver); b.MouseLeftButtonUp += (s, e) => click(); }
+            return b;
+        }
+
+        DispatcherTimer saveTimer;
+        void SaveSoon()
+        {   // the slider changes many times a second while it's dragged: write the file once it settles
+            if (saveTimer == null)
+            {
+                saveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+                saveTimer.Tick += (s, e) => { saveTimer.Stop(); Set.Save(); };
+            }
+            saveTimer.Stop(); saveTimer.Start();
+        }
+
+        void SetTileSize(string size)
+        {
+            if (Set.TileSize == size) return;
+            Set.TileSize = size; Set.Save();
+            Shell.IconUnits = Set.IconUnits;
+            homeDirty = true;
+            Scan(true, true);   // fetch the icons again at the new size, so they stay sharp
+            Geometry();         // new width, rounded corners and shadow
+            if (IsOpen && !parked && !aActive) MoveTo(IntPtr.Zero, pxLeft, pxFinalTop, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        public void ShowAbout()
+        {
+            bool fromHome = view == "home";
+            view = "about";
+            var a = typeof(StartWindow).Assembly;
+            var desc = (AssemblyDescriptionAttribute)Attribute.GetCustomAttribute(a, typeof(AssemblyDescriptionAttribute));
+            var ver = (AssemblyInformationalVersionAttribute)Attribute.GetCustomAttribute(a, typeof(AssemblyInformationalVersionAttribute));
+            var sp = new StackPanel { Margin = new Thickness(Pad - 2, 0, Pad, 12) };
+
+            var top = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 2, 0, 16) };
+            var logo = AppLogo();
+            if (logo != null) top.Children.Add(new Image { Source = logo, Width = 48, Height = 48, Margin = new Thickness(0, 0, 14, 0) });
+            var names = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            names.Children.Add(new TextBlock { Text = "Tessera", FontSize = 20, FontWeight = FontWeights.SemiBold, FontFamily = new FontFamily("Segoe UI Variable Display, Segoe UI") });
+            names.Children.Add(new TextBlock { Text = "Version " + ver.InformationalVersion, FontSize = 12, Foreground = Fg3, Margin = new Thickness(0, 2, 0, 0) });
+            top.Children.Add(names);
+            sp.Children.Add(top);
+
+            var how = new TextBlock { FontSize = 12.5, Foreground = Fg2, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 10, 0, 0), LineHeight = 20,
+                Text = "Opens with the Windows key, Ctrl+Esc and the taskbar Start button.\n" +
+                       "Categories: right-click a card or an app, or edit categories.txt.\n" +
+                       "Settings, the on/off switch for the takeover, and Exit: right-click the footer." };
+            sp.Children.Add(Group("How it works", desc.Description, null, how));
+
+            var dir = AppDomain.CurrentDomain.BaseDirectory;
+            var loc = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
+            loc.Children.Add(new TextBlock { Text = dir, FontSize = 12.5, Foreground = Fg2, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) });
+            var open = new StackPanel { Orientation = Orientation.Horizontal };
+            open.Children.Add(Choice("Open folder", false, () => { HideMenu(); Process.Start("explorer.exe", "\"" + dir.TrimEnd('\\') + "\""); }));
+            loc.Children.Add(open);
+            sp.Children.Add(Group("Location", "Tessera.exe, categories.txt and settings.ini are here.", null, loc));
+            SetPage(PageGrid("About", null, sp), fromHome ? 1 : 0);
+        }
+
+        static ImageSource logo;
+        static ImageSource AppLogo()
+        {
+            if (logo != null) return logo;
+            try
+            {
+                using (var s = typeof(StartWindow).Assembly.GetManifestResourceStream("Tessera.ico"))
+                {
+                    var dec = new IconBitmapDecoder(s, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+                    int want = (int)Math.Round(48 * Shell.Scale);
+                    BitmapFrame best = null;
+                    foreach (var f in dec.Frames)
+                    {   // the smallest image at least as big as it's shown (so it's only ever shrunk), else the biggest
+                        if (best == null) best = f;
+                        else if (best.PixelWidth < want ? f.PixelWidth > best.PixelWidth : (f.PixelWidth >= want && f.PixelWidth < best.PixelWidth)) best = f;
+                    }
+                    if (best != null) { best.Freeze(); logo = best; }
+                }
+            }
+            catch { }
+            return logo;
+        }
+
+        // Right-click on the footer: what used to be on the tray icon's menu
+        ContextMenu FooterMenu()
+        {
+            var cm = new ContextMenu();
+            cm.Opened += (s, e) =>
+            {
+                cm.Items.Clear();
+                cm.Items.Add(MI("Settings", () => ShowSettings()));
+                cm.Items.Add(MI("Edit categories", () => { HideMenu(); Process.Start("notepad.exe", "\"" + Cfg.Path + "\""); }));
+                bool on = GetTakeover != null && GetTakeover();
+                var t = MI("Open with Windows key and Start button", () => { if (SetTakeover != null) SetTakeover(!on); });
+                t.IsChecked = on;
+                cm.Items.Add(t);
+                cm.Items.Add(new Separator());
+                cm.Items.Add(MI("About Tessera", () => ShowAbout()));
+                cm.Items.Add(MI("Exit Tessera", () => { if (ExitApp != null) ExitApp(); }));
+            };
+            cm.Items.Add(new MenuItem());   // placeholder so the menu opens; filled in Opened
+            return cm;
         }
 
         void ShowSearch(string q)
@@ -1389,6 +1923,12 @@ namespace Tessera
       <ControlTemplate TargetType='Separator'><Border Height='1' Background='#1FFFFFFF' Margin='6,4'/></ControlTemplate>
     </Setter.Value></Setter>
   </Style>
+  <!-- separators inside menus look up this key instead of the plain Separator style above -->
+  <Style x:Key='{x:Static MenuItem.SeparatorStyleKey}' TargetType='Separator'>
+    <Setter Property='Template'><Setter.Value>
+      <ControlTemplate TargetType='Separator'><Border Height='1' Background='#1FFFFFFF' Margin='6,4'/></ControlTemplate>
+    </Setter.Value></Setter>
+  </Style>
   <Style TargetType='MenuItem'>
     <Setter Property='Foreground' Value='White'/>
     <Setter Property='Template'><Setter.Value>
@@ -1399,6 +1939,8 @@ namespace Tessera
             <ContentPresenter ContentSource='Header' RecognizesAccessKey='False'/>
             <TextBlock x:Name='Arrow' Grid.Column='1' Text='&#xE76C;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='10' Margin='18,0,0,0'
                        VerticalAlignment='Center' Foreground='#A6FFFFFF' Visibility='Collapsed'/>
+            <TextBlock x:Name='Check' Grid.Column='1' Text='&#xE73E;' FontFamily='Segoe Fluent Icons, Segoe MDL2 Assets' FontSize='12' Margin='18,0,0,0'
+                       VerticalAlignment='Center' Foreground='#FF4CC2FF' Visibility='Collapsed'/>
             <Popup x:Name='PART_Popup' Placement='Right' HorizontalOffset='8' VerticalOffset='-5' AllowsTransparency='True' Focusable='False'
                    IsOpen='{Binding IsSubmenuOpen, RelativeSource={RelativeSource TemplatedParent}}'>
               <Border Background='#FF2C2C2C' BorderBrush='#26FFFFFF' BorderThickness='1' CornerRadius='8' Padding='4'>
@@ -1410,7 +1952,43 @@ namespace Tessera
         <ControlTemplate.Triggers>
           <Trigger Property='IsHighlighted' Value='True'><Setter TargetName='Bd' Property='Background' Value='#1FFFFFFF'/></Trigger>
           <Trigger Property='HasItems' Value='True'><Setter TargetName='Arrow' Property='Visibility' Value='Visible'/></Trigger>
+          <Trigger Property='IsChecked' Value='True'><Setter TargetName='Check' Property='Visibility' Value='Visible'/></Trigger>
         </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value></Setter>
+  </Style>
+  <Style x:Key='SliderFill' TargetType='RepeatButton'>
+    <Setter Property='Focusable' Value='False'/><Setter Property='IsTabStop' Value='False'/>
+    <Setter Property='Template'><Setter.Value>
+      <ControlTemplate TargetType='RepeatButton'><Border Height='4' CornerRadius='2' Background='#FF4CC2FF'/></ControlTemplate>
+    </Setter.Value></Setter>
+  </Style>
+  <Style x:Key='SliderRest' TargetType='RepeatButton'>
+    <Setter Property='Focusable' Value='False'/><Setter Property='IsTabStop' Value='False'/>
+    <Setter Property='Template'><Setter.Value>
+      <ControlTemplate TargetType='RepeatButton'><Border Background='Transparent'/></ControlTemplate>
+    </Setter.Value></Setter>
+  </Style>
+  <Style TargetType='Slider'>
+    <Setter Property='Template'><Setter.Value>
+      <ControlTemplate TargetType='Slider'>
+        <Grid Height='24' Background='Transparent'>
+          <Border Height='4' CornerRadius='2' Background='#33FFFFFF' VerticalAlignment='Center' Margin='2,0'/>
+          <Track x:Name='PART_Track'>
+            <Track.DecreaseRepeatButton><RepeatButton Command='Slider.DecreaseLarge' Style='{StaticResource SliderFill}'/></Track.DecreaseRepeatButton>
+            <Track.IncreaseRepeatButton><RepeatButton Command='Slider.IncreaseLarge' Style='{StaticResource SliderRest}'/></Track.IncreaseRepeatButton>
+            <Track.Thumb><Thumb Width='20' Height='20'><Thumb.Template><ControlTemplate TargetType='Thumb'>
+              <Grid>
+                <Ellipse Fill='#FF454545' Stroke='#33FFFFFF' StrokeThickness='1'/>
+                <Ellipse x:Name='Dot' Width='10' Height='10' Fill='#FF4CC2FF'/>
+              </Grid>
+              <ControlTemplate.Triggers>
+                <Trigger Property='IsMouseOver' Value='True'><Setter TargetName='Dot' Property='Width' Value='12'/><Setter TargetName='Dot' Property='Height' Value='12'/></Trigger>
+                <Trigger Property='IsDragging' Value='True'><Setter TargetName='Dot' Property='Width' Value='8'/><Setter TargetName='Dot' Property='Height' Value='8'/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+          </Track>
+        </Grid>
       </ControlTemplate>
     </Setter.Value></Setter>
   </Style>
@@ -1436,6 +2014,7 @@ namespace Tessera
 
         const string InstanceName = "Local\\Tessera.Instance", HelperName = "Local\\Tessera.Helper",
             ShowName = "Local\\Tessera.Show", ToggleName = "Local\\Tessera.Toggle",
+            ToggleKeyName = "Local\\Tessera.ToggleKey",   // like Toggle, from the keyboard: opens on the monitor you're working on
             // shared with the Windhawk mod (custom-start-takeover.wh.cpp)
             ModName = "Local\\Tessera.Mod", EnabledName = "Local\\Tessera.Enabled";
         static string Dir { get { return AppDomain.CurrentDomain.BaseDirectory; } }
@@ -1460,12 +2039,20 @@ namespace Tessera
             var mutex = new Mutex(true, HelperName, out first);
             if (!first) return;
             try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
-            EventWaitHandle toggle = null;
-            Hooks.Toggle = () =>
+            EventWaitHandle toggle = null, toggleKey = null;
+            Hooks.Toggle = keyboard =>
             {
                 ThreadPool.QueueUserWorkItem(_ =>
                 {
                     AllowSetForegroundWindow(-1);   // let the menu take focus even over an admin window
+                    if (keyboard)
+                        try
+                        {
+                            if (toggleKey == null) toggleKey = EventWaitHandle.OpenExisting(ToggleKeyName);
+                            toggleKey.Set();
+                            return;
+                        }
+                        catch { toggleKey = null; }   // a menu from before 1.1: the plain toggle below
                     try
                     {
                         if (toggle == null) toggle = EventWaitHandle.OpenExisting(ToggleName);
@@ -1542,10 +2129,13 @@ namespace Tessera
             SetProcessDPIAware();
             try { using (var g = SD.Graphics.FromHwnd(IntPtr.Zero)) Shell.Scale = g.DpiX / 96.0; } catch { }
             var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-            var win = new StartWindow(new Config(Path.Combine(Dir, "categories.txt")));
+            var settings = new Settings(Path.Combine(Dir, "settings.ini"));
+            Shell.IconUnits = settings.IconUnits;
+            var win = new StartWindow(new Config(Path.Combine(Dir, "categories.txt")), settings);
             new WindowInteropHelper(win).EnsureHandle();
+            var toggleKeyEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ToggleKeyName);
 
-            Hooks.Toggle = () => win.Dispatcher.BeginInvoke((Action)win.Toggle);
+            Hooks.Toggle = keyboard => win.Dispatcher.BeginInvoke(new Action(() => win.Toggle(keyboard)));
             Hooks.Enabled = !File.Exists(DisabledFlag);
             // for the Windhawk mod: "takeover is on" (the event only exists while this runs)
             var enabledEvent = new EventWaitHandle(Hooks.Enabled, EventResetMode.ManualReset, EnabledName);
@@ -1555,6 +2145,8 @@ namespace Tessera
             waiter.IsBackground = true; waiter.Start();
             var toggler = new Thread(() => { while (true) { toggleEvent.WaitOne(); win.Dispatcher.BeginInvoke((Action)win.Toggle); } });
             toggler.IsBackground = true; toggler.Start();
+            var keyToggler = new Thread(() => { while (true) { toggleKeyEvent.WaitOne(); win.Dispatcher.BeginInvoke(new Action(() => win.Toggle(true))); } });
+            keyToggler.IsBackground = true; keyToggler.Start();
 
             // Use our own key/mouse watching only when the admin helper isn't running
             var helperWatch = new Thread(() =>
@@ -1570,23 +2162,32 @@ namespace Tessera
             });
             helperWatch.IsBackground = true; helperWatch.Start();
 
-            tray = new WF.NotifyIcon { Text = "Tessera", Icon = AppIcon(), Visible = true };
+            // The tray icon is hidden unless Settings > Tray icon says otherwise: its options are on the footer's
+            // right-click menu too (see StartWindow.FooterMenu)
+            tray = new WF.NotifyIcon { Text = "Tessera", Icon = AppIcon(), Visible = settings.ShowTrayIcon };
             var menu = new WF.ContextMenuStrip();
             menu.Items.Add("Open Tessera", null, (s, e) => win.ShowMenu());
             menu.Items.Add("Edit categories", null, (s, e) => Process.Start("notepad.exe", "\"" + win.Cfg.Path + "\""));
             var takeover = new WF.ToolStripMenuItem("Open with Windows key and Start button") { Checked = Hooks.Enabled, CheckOnClick = true };
-            takeover.CheckedChanged += (s, e) =>
+            Action<bool> setTakeover = on =>
             {
-                Hooks.Enabled = takeover.Checked;
-                if (takeover.Checked) enabledEvent.Set(); else enabledEvent.Reset();
-                try { if (takeover.Checked) File.Delete(DisabledFlag); else File.WriteAllText(DisabledFlag, "off"); } catch { }
+                Hooks.Enabled = on;
+                if (on) enabledEvent.Set(); else enabledEvent.Reset();
+                try { if (on) File.Delete(DisabledFlag); else File.WriteAllText(DisabledFlag, "off"); } catch { }
+                if (takeover.Checked != on) takeover.Checked = on;
             };
+            takeover.CheckedChanged += (s, e) => { if (takeover.Checked != Hooks.Enabled) setTakeover(takeover.Checked); };
+            Action exit = () => { tray.Visible = false; Hooks.Stop(); win.Exiting = true; app.Shutdown(); };
             menu.Items.Add(takeover);
             menu.Items.Add(new WF.ToolStripSeparator());
-            menu.Items.Add("About Tessera", null, (s, e) => ShowAbout());
-            menu.Items.Add("Exit", null, (s, e) => { tray.Visible = false; Hooks.Stop(); win.Exiting = true; app.Shutdown(); });
+            menu.Items.Add("About Tessera", null, (s, e) => { win.ShowMenu(); win.ShowAbout(); });
+            menu.Items.Add("Exit", null, (s, e) => exit());
             tray.ContextMenuStrip = menu;
             tray.MouseClick += (s, e) => { if (e.Button == WF.MouseButtons.Left) win.ShowMenu(); };
+            win.GetTakeover = () => Hooks.Enabled;
+            win.SetTakeover = setTakeover;
+            win.ExitApp = exit;
+            win.ShowTray = on => tray.Visible = on;
 
             // restart into a new build automatically when Tessera.exe is replaced
             var stamp = ExeStamp();
@@ -1611,18 +2212,6 @@ namespace Tessera
         {
             using (var s = typeof(Program).Assembly.GetManifestResourceStream("Tessera.ico"))
                 return new SD.Icon(s, WF.SystemInformation.SmallIconSize);
-        }
-
-        static void ShowAbout()
-        {
-            var a = typeof(Program).Assembly;
-            var desc = (AssemblyDescriptionAttribute)Attribute.GetCustomAttribute(a, typeof(AssemblyDescriptionAttribute));
-            var ver = (AssemblyInformationalVersionAttribute)Attribute.GetCustomAttribute(a, typeof(AssemblyInformationalVersionAttribute));
-            WF.MessageBox.Show(
-                "Tessera " + ver.InformationalVersion + "\n\n" + desc.Description + "\n\n" +
-                "Opens with the Windows key, Ctrl+Esc and the taskbar Start button.\n" +
-                "Categories: right-click the menu, or edit categories.txt.\n\n" + Dir,
-                "About Tessera", WF.MessageBoxButtons.OK, WF.MessageBoxIcon.Information);
         }
     }
 }

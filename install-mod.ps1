@@ -43,3 +43,11 @@ $ini = "[Mod]`r`nLibraryFileName=$dllName`r`nDisabled=0`r`nInclude=$include`r`nE
 [IO.File]::WriteAllText("$modsDir\$id.ini", $ini, [Text.Encoding]::Unicode)
 Copy-Item $src "$wh\AppData\ModsSource\$id.wh.cpp" -Force
 Write-Output "installed $id $version ($dllName)"
+
+# Windhawk unloads the previous build from explorer a few seconds after the ini changes; delete it then
+for ($i = 0; $i -lt 15; $i++) {
+    $old = @(Get-ChildItem "$modsDir\64" -Filter "$id`_*.dll" | Where-Object Name -ne $dllName)
+    if ($old.Count -eq 0) { break }
+    foreach ($f in $old) { try { Remove-Item $f.FullName -Force } catch { } }
+    Start-Sleep -Seconds 1
+}
