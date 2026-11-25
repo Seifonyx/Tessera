@@ -71,12 +71,15 @@ foreach ($name in 'Tessera', 'Tessera Helper') {
 
 Write-Host "`nProcesses"
 $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'Tessera.exe'")
-$menu = @($procs | Where-Object { $_.CommandLine -notmatch '--hook' })
-$helper = @($procs | Where-Object { $_.CommandLine -match '--hook' })
+# An elevated helper's command line is unreadable from a normal shell, so a null one counts as the helper.
+$menu = @($procs | Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--hook' })
+$helper = @($procs | Where-Object { -not $_.CommandLine -or $_.CommandLine -match '--hook' })
 Line ($menu.Count -eq 1) ("menu process running: " + $menu.Count + $(if ($menu.Count) { " (pid " + ($menu.ProcessId -join ', ') + ")" }))
 Line ($helper.Count -eq 1) ("helper process running: " + $helper.Count + $(if ($helper.Count) { " (pid " + ($helper.ProcessId -join ', ') + ")" }))
 if ($procs.Count) {
-  $exe = $procs[0].ExecutablePath
+  $withPath = @($procs | Where-Object { $_.ExecutablePath })
+  $exe = $null
+  if ($withPath.Count) { $exe = $withPath[0].ExecutablePath }
   if ($exe) { Note ("running " + $exe + ", version " + (Get-Item $exe).VersionInfo.FileVersion) }
 }
 
