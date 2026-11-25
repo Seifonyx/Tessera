@@ -44,6 +44,7 @@ namespace Tessera
         public ImageSource Icon;
         public string Path;     // file-system path; non-null only for file results (never in the apps list)
         public string Detail;   // right-hand subtitle for file results
+        public int Source;      // 0 app, 1 PATH, 2 App Paths, 3 search index, 4 typed path
     }
 
     // ---------------------------------------------------------------- shell: list apps, icons, launching
@@ -238,10 +239,10 @@ namespace Tessera
             return !string.IsNullOrEmpty(ext) && IsExt(ext) ? name.Substring(0, name.Length - ext.Length) : name;
         }
 
-        static AppEntry Make(string path, string name, string detail)
+        static AppEntry Make(string path, string name, string detail, int source)
         {
             var e = new AppEntry();
-            e.Path = path; e.Id = path; e.Name = name; e.Detail = detail;
+            e.Path = path; e.Id = path; e.Name = name; e.Detail = detail; e.Source = source;
             return e;
         }
 
@@ -291,7 +292,7 @@ namespace Tessera
                             if (!IsExt(System.IO.Path.GetExtension(f))) continue;
                             string fn = System.IO.Path.GetFileName(f);
                             if (!pathNames.Add(fn) || !seen.Add(f)) continue;
-                            list.Add(Make(f, fn, "Command"));
+                            list.Add(Make(f, fn, "Command", 1));
                         }
                         catch { }
                     }
@@ -326,7 +327,7 @@ namespace Tessera
                                     v = Environment.ExpandEnvironmentVariables(v.Trim().Trim('"').Trim());
                                     if (v.Length == 0 || !File.Exists(v) || !seen.Add(v)) continue;
                                     string name = System.IO.Path.GetExtension(sub).Length > 0 ? sub : System.IO.Path.GetFileName(v);
-                                    list.Add(Make(v, name, ParentName(v)));
+                                    list.Add(Make(v, name, ParentName(v), 2));
                                 }
                             }
                             catch { }
@@ -369,7 +370,7 @@ namespace Tessera
                                 string p = rd.GetValue(0) as string;
                                 if (string.IsNullOrEmpty(p) || !seen.Add(p)) continue;
                                 try { if (!File.Exists(p)) continue; } catch { continue; }
-                                list.Add(Make(p, System.IO.Path.GetFileName(p), ParentName(p)));
+                                list.Add(Make(p, System.IO.Path.GetFileName(p), ParentName(p), 3));
                             }
                         }
                     }
@@ -377,6 +378,32 @@ namespace Tessera
             }
             catch { }
             return list;
+        }
+
+        static readonly string[] JunkNames = { "setup", "install", "updater", "update", "crashpad", "crashreport", "crash_handler", "crashhandler",
+            "errorreport", "bugreport", "helper", "elevat", "notification_helper", "redist", "vcredist", "dxsetup", "squirrel", "createdump",
+            "dotnet-install", "_test", "test_" };
+        static readonly string[] JunkPaths = { "\\node_modules\\", "\\.git\\", "\\site-packages\\", "\\__pycache__\\", "\\$recycle.bin\\",
+            "\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\temp\\", "\\tmp\\", "\\winsxs\\", "\\windows\\installer\\",
+            "\\package cache\\", "\\_commonredist\\", "\\redist\\", "\\redistributables\\", "\\directx\\", "\\vendor\\",
+            "\\.cargo\\registry\\", "\\go\\pkg\\mod\\", "\\.nuget\\", "\\.vscode\\extensions\\", "\\resources\\app\\",
+            "\\locales\\", "\\test\\", "\\tests\\", "\\examples\\", "\\samples\\" };
+
+        // Installers, uninstallers, helper binaries and library-folder hits. Callers never ask about files the user has launched.
+        public static bool IsJunk(AppEntry f)
+        {
+            try
+            {
+                string p = (f.Path ?? "").ToLowerInvariant();
+                string n = System.IO.Path.GetFileNameWithoutExtension(p);
+                if (n.StartsWith("unins") || n.StartsWith("uninst") || n.StartsWith("uninstall")) return true;
+                foreach (var j in JunkNames) if (n.Contains(j)) return true;
+                if (n == "vc_redist.x64" || n == "vc_redist.x86" || n == "dxwebsetup" || n.StartsWith("ndp")) return true;
+                foreach (var j in JunkPaths) if (p.Contains(j)) return true;
+                if (f.Source == 3 && p.Split('\\').Length - 2 > 6) return true;
+            }
+            catch { }
+            return false;
         }
 
         public static ImageSource Cached(string path)
@@ -411,6 +438,188 @@ namespace Tessera
     }
 
     // ---------------------------------------------------------------- categories.txt
+    // ---------------------------------------------------------------- usage: what the user actually launches
+    class UsageInfo { public int Count; public DateTime Last; }
+
+    static class Usage
+    {
+        const string UaRoot = @"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist";
+        static readonly string[] UaGuids = { "{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}", "{F4E57C4B-2036-45F0-A9AB-443BCFE33D9F}" };
+        static readonly object gate = new object();
+        static Dictionary<string, UsageInfo> own;                 // Tessera's own launches (usage.txt)
+        static Dictionary<string, UsageInfo> windows = NewMap();  // Windows' UserAssist history
+        static readonly Dictionary<string, string> folderCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        [DllImport("shell32.dll")]
+        static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid rfid, uint dwFlags, IntPtr hToken, out IntPtr ppszPath);
+
+        public static Dictionary<string, UsageInfo> NewMap() { return new Dictionary<string, UsageInfo>(StringComparer.OrdinalIgnoreCase); }
+
+        static string FilePath { get { return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "usage.txt"); } }
+
+        static void Add(Dictionary<string, UsageInfo> d, string key, int count, DateTime last)
+        {
+            if (string.IsNullOrEmpty(key)) return;
+            key = key.ToLowerInvariant();
+            UsageInfo u;
+            if (!d.TryGetValue(key, out u)) { u = new UsageInfo(); d[key] = u; }
+            u.Count += count;
+            if (last > u.Last) u.Last = last;
+        }
+
+        static string Rot13(string s)
+        {
+            var sb = new StringBuilder(s.Length);
+            foreach (char c in s)
+            {
+                if (c >= 'a' && c <= 'z') sb.Append((char)('a' + (c - 'a' + 13) % 26));
+                else if (c >= 'A' && c <= 'Z') sb.Append((char)('A' + (c - 'A' + 13) % 26));
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        // "{GUID}\\cmd.exe" -> "C:\\Windows\\System32\\cmd.exe"; null when there is no known-folder prefix or it can't be resolved
+        public static string ResolveKnownFolder(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id.Length < 40 || id[0] != '{' || id[37] != '}' || id[38] != '\\') return null;
+            string g = id.Substring(0, 38);
+            string dir;
+            lock (folderCache)
+            {
+                if (!folderCache.TryGetValue(g, out dir))
+                {
+                    dir = null;
+                    try
+                    {
+                        Guid guid;
+                        if (Guid.TryParse(g, out guid))
+                        {
+                            IntPtr p;
+                            if (SHGetKnownFolderPath(guid, 0, IntPtr.Zero, out p) == 0 && p != IntPtr.Zero)
+                            {
+                                try { dir = Marshal.PtrToStringUni(p); } finally { Marshal.FreeCoTaskMem(p); }
+                            }
+                        }
+                    }
+                    catch { dir = null; }
+                    folderCache[g] = dir;
+                }
+            }
+            if (string.IsNullOrEmpty(dir)) return null;
+            try { return System.IO.Path.Combine(dir, id.Substring(39)); } catch { return null; }
+        }
+
+        // Reads Windows' launch history. Runs on the scan thread.
+        public static void Reload()
+        {
+            var d = NewMap();
+            foreach (var g in UaGuids)
+            {
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(UaRoot + "\\" + g + "\\Count"))
+                    {
+                        if (k == null) continue;
+                        foreach (var vn in k.GetValueNames())
+                        {
+                            try
+                            {
+                                string name = Rot13(vn);
+                                if (name.StartsWith("UEME_", StringComparison.OrdinalIgnoreCase)) continue;
+                                var data = k.GetValue(vn) as byte[];
+                                if (data == null || data.Length < 68) continue;
+                                int count = BitTools.Int32(data, 4);
+                                long ft = BitTools.Int64(data, 60);
+                                DateTime last = default(DateTime);
+                                if (ft > 0) { try { last = DateTime.FromFileTimeUtc(ft); } catch { last = default(DateTime); } }
+                                if (count <= 0 && last == default(DateTime)) continue;
+                                Add(d, name, count, last);
+                                string real = ResolveKnownFolder(name);
+                                if (real != null) Add(d, real, count, last);
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+            }
+            lock (gate) windows = d;
+        }
+
+        static void LoadOwn()
+        {
+            var d = NewMap();
+            try
+            {
+                if (File.Exists(FilePath))
+                    foreach (var line in File.ReadAllLines(FilePath))
+                    {
+                        var p = line.Split('\t');
+                        if (p.Length < 3) continue;
+                        int c; long t;
+                        if (!int.TryParse(p[0], out c) || !long.TryParse(p[1], out t)) continue;
+                        DateTime last;
+                        try { last = new DateTime(t, DateTimeKind.Utc); } catch { last = default(DateTime); }
+                        Add(d, string.Join("\t", p, 2, p.Length - 2), c, last);
+                    }
+            }
+            catch { }
+            own = d;
+        }
+
+        public static void Record(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return;
+            lock (gate)
+            {
+                if (own == null) LoadOwn();
+                Add(own, key, 1, DateTime.UtcNow);
+            }
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    lock (gate)
+                    {
+                        if (own == null) return;
+                        var sb = new StringBuilder();
+                        foreach (var kv in own) sb.Append(kv.Value.Count).Append('\t').Append(kv.Value.Last.Ticks).Append('\t').Append(kv.Key).Append("\r\n");
+                        File.WriteAllText(FilePath, sb.ToString());
+                    }
+                }
+                catch { }
+            });
+        }
+
+        // Windows' history and Tessera's own launches, merged
+        public static Dictionary<string, UsageInfo> Snapshot()
+        {
+            var d = NewMap();
+            lock (gate)
+            {
+                if (own == null) LoadOwn();
+                foreach (var kv in windows) Add(d, kv.Key, kv.Value.Count, kv.Value.Last);
+                foreach (var kv in own) Add(d, kv.Key, kv.Value.Count, kv.Value.Last);
+            }
+            return d;
+        }
+
+        public static double Frecency(UsageInfo u)
+        {
+            if (u == null) return 0;
+            double age = (DateTime.UtcNow - u.Last).TotalDays;
+            double bonus = u.Last == default(DateTime) ? 0 : age <= 3 ? 0.8 : age <= 14 ? 0.5 : age <= 60 ? 0.2 : 0;
+            return Math.Min(2.0, Math.Log(1 + u.Count, 2) * 0.35 + bonus);
+        }
+    }
+
+    static class BitTools
+    {
+        public static int Int32(byte[] b, int o) { return BitConverter.ToInt32(b, o); }
+        public static long Int64(byte[] b, int o) { return BitConverter.ToInt64(b, o); }
+    }
+
     public class Category { public string Name; public List<string> Keys = new List<string>(); }
 
     public class Config
@@ -903,6 +1112,7 @@ namespace Tessera
         List<AppEntry> viewList;
         List<Border> resultRows = new List<Border>();
         List<AppEntry> results = new List<AppEntry>();
+        Dictionary<string, UsageInfo> usage = Usage.NewMap();   // launch history, refreshed on every scan
         List<AppEntry> commands = new List<AppEntry>();      // programs on PATH + App Paths entries, refreshed on every scan
         List<AppEntry> indexHits = new List<AppEntry>();     // results of the last completed Windows Search index query...
         string indexQuery = "";                              // ...and the query they belong to
@@ -1251,11 +1461,14 @@ namespace Tessera
                 try { list = Shell.Enumerate(cache); } catch { list = null; }
                 List<AppEntry> cmds;
                 try { cmds = FileSearch.ScanCommands(); } catch { cmds = null; }
+                Dictionary<string, UsageInfo> usg;
+                try { Usage.Reload(); usg = Usage.Snapshot(); } catch { usg = null; }
                 if (warm) { try { FileSearch.QueryIndex("tessera-warmup", 1); } catch { } }   // loads OLE DB so the first real search isn't slow
                 Action done = () =>
                 {
                     if (list != null && list.Count > 0) { var old = apps; apps = list; Shell.Free(old); homeDirty = true; }
                     if (cmds != null) commands = cmds;
+                    if (usg != null) usage = usg;
                     lastScan = DateTime.Now; scanning = false;
                     if (rescanFresh) { rescanFresh = false; Scan(true, true); }
                 };
@@ -1411,7 +1624,44 @@ namespace Tessera
             });
         }
 
-        void Run(AppEntry a, bool admin) { HideMenu(); if (a.Path != null) FileSearch.Launch(a, admin); else Shell.Launch(a, admin); }
+        double UsageOf(AppEntry a)
+        {
+            double best = 0;
+            try
+            {
+                var keys = new List<string>();
+                if (a.Path != null) keys.Add(a.Path);
+                else if (a.Id != null)
+                {
+                    keys.Add(a.Id);
+                    string real = Usage.ResolveKnownFolder(a.Id);
+                    if (real != null) keys.Add(real);
+                }
+                foreach (var k in keys)
+                {
+                    UsageInfo u;
+                    if (usage.TryGetValue(k.ToLowerInvariant(), out u)) best = Math.Max(best, Usage.Frecency(u));
+                }
+            }
+            catch { }
+            return best;
+        }
+
+        void NoteLaunch(AppEntry a)
+        {
+            try
+            {
+                string key = a.Path != null ? a.Path.ToLowerInvariant() : (a.Id != null ? a.Id.ToLowerInvariant() : null);
+                if (key == null) return;
+                Usage.Record(key);
+                UsageInfo u;
+                if (!usage.TryGetValue(key, out u)) { u = new UsageInfo(); usage[key] = u; }
+                u.Count++; u.Last = DateTime.UtcNow;
+            }
+            catch { }
+        }
+
+        void Run(AppEntry a, bool admin) { NoteLaunch(a); HideMenu(); if (a.Path != null) FileSearch.Launch(a, admin); else Shell.Launch(a, admin); }
 
         // ------------------------------------------------ layout
         void BuildShell()
@@ -1942,6 +2192,21 @@ namespace Tessera
             return -1;
         }
 
+        static double h_rank(SearchHit h, double use) { return h.S + (h.E.Path != null ? 0.5 : 0) - use; }
+
+        static int SourceOrder(int src) { return src == 1 ? 0 : src == 2 ? 1 : src == 3 ? 2 : 3; }
+
+        static bool IsUnderWindows(string path)
+        {
+            try
+            {
+                string root = Environment.GetEnvironmentVariable("SystemRoot");
+                if (string.IsNullOrEmpty(root)) return false;
+                return path.StartsWith(root.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
         void ShowSearch(string q) { ShowSearch(q, false); }
 
         // keepSel: this is the re-render after the background pass, so keep the user's moved selection on the same entry
@@ -1961,7 +2226,9 @@ namespace Tessera
             foreach (var c in commands)
             {
                 int s = Score(c.Name, q);
-                if (s == 0 || s == 1) fileHits.Add(new SearchHit { E = c, S = s });
+                if (s != 0 && s != 1) continue;
+                if (s != 0 && c.Source == 1 && IsUnderWindows(c.Path)) continue;   // System32 noise: exact matches only
+                fileHits.Add(new SearchHit { E = c, S = s });
             }
             List<AppEntry> ih = null;
             if (indexQuery == q) ih = indexHits;
@@ -1979,7 +2246,7 @@ namespace Tessera
                 try
                 {
                     string p = Environment.ExpandEnvironmentVariables(q);
-                    if (File.Exists(p) || Directory.Exists(p)) typed = new AppEntry { Name = q, Id = p, Path = p, Detail = "Open" };
+                    if (File.Exists(p) || Directory.Exists(p)) typed = new AppEntry { Name = q, Id = p, Path = p, Detail = "Open", Source = 4 };
                 }
                 catch { }
             }
@@ -1987,6 +2254,7 @@ namespace Tessera
             var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (typed != null) seenPaths.Add(typed.Path);
             var all = new List<SearchHit>(appHits);
+            var cand = new List<SearchHit>();
             foreach (var h in fileHits)
             {
                 if (!seenPaths.Add(h.E.Path)) continue;
@@ -1996,9 +2264,36 @@ namespace Tessera
                 {
                     if (ah.E.Name.Equals(bare, StringComparison.OrdinalIgnoreCase) || (ah.E.Id != null && ah.E.Id.EndsWith("\\" + h.E.Name, StringComparison.OrdinalIgnoreCase))) { dup = true; break; }
                 }
-                if (!dup) all.Add(h);
+                if (!dup) cand.Add(h);
             }
-            var ordered = all.OrderBy(h => h.S).ThenBy(h => h.E.Path != null ? 1 : 0).ThenBy(h => h.E.Name).Take(typed != null ? 39 : 40).Select(h => h.E).ToList();
+            // junk (unless launched before), then one row per file name, then the best 8 files
+            var best = new Dictionary<string, SearchHit>(StringComparer.OrdinalIgnoreCase);
+            var bestUse = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            foreach (var h in cand)
+            {
+                double u = UsageOf(h.E);
+                if (u <= 0 && FileSearch.IsJunk(h.E)) continue;
+                string fn = System.IO.Path.GetFileName(h.E.Path);
+                SearchHit cur;
+                if (best.TryGetValue(fn, out cur))
+                {
+                    double cu = bestUse[fn];
+                    bool better = u > cu;
+                    if (u == cu)
+                    {
+                        int rs = SourceOrder(h.E.Source), rc = SourceOrder(cur.E.Source);
+                        better = rs < rc || (rs == rc && h.E.Path.Length < cur.E.Path.Length);
+                    }
+                    if (!better) continue;
+                }
+                best[fn] = h; bestUse[fn] = u;
+            }
+            var ranked = new List<KeyValuePair<double, SearchHit>>();
+            foreach (var kv in best) ranked.Add(new KeyValuePair<double, SearchHit>(h_rank(kv.Value, bestUse[kv.Key]), kv.Value));
+            foreach (var x in ranked.OrderBy(x => x.Key).ThenBy(x => x.Value.E.Name).Take(8)) all.Add(x.Value);
+            var orderedHits = new List<KeyValuePair<double, SearchHit>>();
+            foreach (var h in all) orderedHits.Add(new KeyValuePair<double, SearchHit>(h_rank(h, UsageOf(h.E)), h));
+            var ordered = orderedHits.OrderBy(x => x.Key).ThenBy(x => x.Value.E.Name).Take(typed != null ? 39 : 40).Select(x => x.Value.E).ToList();
             if (typed != null) ordered.Insert(0, typed);
             results = ordered;
             foreach (var a in results) if (a.Path != null && a.Icon == null) a.Icon = FileSearch.Cached(a.Path);
