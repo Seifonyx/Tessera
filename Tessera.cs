@@ -383,7 +383,7 @@ namespace Tessera
         static readonly string[] JunkNames = { "setup", "install", "updater", "update", "crashpad", "crashreport", "crash_handler", "crashhandler",
             "errorreport", "bugreport", "helper", "elevat", "notification_helper", "redist", "vcredist", "dxsetup", "squirrel", "createdump",
             "dotnet-install", "_test", "test_", "startuptask", "webview", "shellext", "overlayui", "_monitor", "xboxutil",
-            "askpass", "askyesno", "credential-", "native-host", "command-runner", "make-data-folder", "steamservice", "py-manager" };
+            "askpass", "askyesno", "credential-", "native-host", "command-runner", "make-data-folder", "steamservice", "py-manager", "-shipping" };
         static readonly string[] JunkPaths = { "\\node_modules\\", "\\.git\\", "\\site-packages\\", "\\__pycache__\\", "\\$recycle.bin\\",
             "\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\temp\\", "\\tmp\\", "\\winsxs\\", "\\windows\\installer\\",
             "\\package cache\\", "\\_commonredist\\", "\\redist\\", "\\redistributables\\", "\\directx\\", "\\vendor\\",
@@ -2195,6 +2195,18 @@ namespace Tessera
             return -1;
         }
 
+        // lowercase, letters and digits only, without a trailing "desktop" or "app"
+        static string NormName(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder();
+            foreach (char c in s) if (char.IsLetterOrDigit(c)) sb.Append(char.ToLowerInvariant(c));
+            string r = sb.ToString();
+            if (r.Length > 7 && r.EndsWith("desktop")) r = r.Substring(0, r.Length - 7);
+            else if (r.Length > 3 && r.EndsWith("app")) r = r.Substring(0, r.Length - 3);
+            return r;
+        }
+
         static double h_rank(SearchHit h, double use) { return h.S + (h.E.Path != null ? 0.5 : 0) - use; }
 
         static int SourceOrder(int src) { return src == 1 ? 0 : src == 2 ? 1 : src == 3 ? 2 : 3; }
@@ -2263,8 +2275,10 @@ namespace Tessera
                 if (!seenPaths.Add(h.E.Path)) continue;
                 string bare = FileSearch.StripExt(h.E.Name);
                 bool dup = false;
+                string nb = NormName(bare);
                 foreach (var ah in appHits)
                 {
+                    if (nb.Length > 0 && nb == NormName(ah.E.Name)) { dup = true; break; }
                     if (ah.E.Name.Equals(bare, StringComparison.OrdinalIgnoreCase) || (ah.E.Id != null && ah.E.Id.EndsWith("\\" + h.E.Name, StringComparison.OrdinalIgnoreCase))) { dup = true; break; }
                 }
                 if (!dup) cand.Add(h);
