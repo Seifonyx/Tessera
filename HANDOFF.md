@@ -1,6 +1,6 @@
 # Tessera: handoff
 
-Updated 2026-11-25 (version 1.1) so a fresh session (or person) can pick this up
+Updated 2026-11-25 (version 1.1, docs update) so a fresh session (or person) can pick this up
 cold. For the user-facing overview see `README.md`; this file is the working
 context behind it.
 
@@ -107,11 +107,17 @@ came ~2 ms after the toggle and the median gap was 18–19 ms.
 
 ## Version control
 
-**There is no git repository and no remote. Everything exists only on this machine.**
+The project is in git and pushed to the private GitHub repo `Seifonyx/Tessera`.
+The commits so far are "Tessera 1.0: initial import from the PC folder" and then
+"Tessera 1.1.0.0 ...". The local folder `C:\Apps\Utilities\Customization\Tessera`
+is the working copy.
 
-A `.gitignore` is already in the folder (`Tessera.exe`, `Tessera.old-*.exe`,
-`debug.log`, `disabled.flag`), but `git init` hasn't been run. If the folder is
-lost, the project is gone.
+`.gitignore` excludes `Tessera.exe`, `Tessera.old-*.exe`, `debug.log` and
+`disabled.flag`, so the build output and runtime files never get committed.
+
+Cloud Claude sessions work on branches named `claude/...` and open draft pull
+requests. After the user merges one, they pull it into the PC folder with
+`git pull` in that folder, and then run `build.cmd` if `Tessera.cs` changed.
 
 ## Where everything lives
 
@@ -138,6 +144,7 @@ lost, the project is gone.
 | `refocus-claude.ps1` | Gives focus back to the Claude window between tests |
 | `debug-output-listener.ps1` | Captures the mod's debug output |
 | `download-pdb.ps1` | Downloads a DLL's symbols from Microsoft's symbol server |
+| `check-health.ps1` | **New.** Read-only health check: the two scheduled tasks (At logon trigger, ran since last boot, result code), the menu and helper processes, the three mutexes, the `Local\Tessera.Enabled` event, and the monitors with their scale and taskbar edge. Run it after signing in, for example `powershell -ExecutionPolicy Bypass -File tools\check-health.ps1`. Every line should say OK. The exit code is the number of problems. |
 
 ### Scheduled tasks
 
@@ -359,8 +366,8 @@ The Claude memory note is
   - Taskbars on the top or side of a monitor aren't handled: the menu always
     slides up from the bottom of the work area.
 - **Reboot test still pending.** Not done, at the user's request: they'll reboot
-  themselves. Afterwards, check the two tasks started (the menu and helper
-  processes exist) and that the three mutexes exist.
+  themselves. After rebooting and signing in, run `tools\check-health.ps1`. If
+  every line says OK, the reboot test has passed.
 - **Click-then-Win edge case.** If you click another window and press Win within
   400 ms, the open is ignored because of the Start button guard. This is rare and
   hasn't been reported.
@@ -378,13 +385,31 @@ The Claude memory note is
   `Tessera.lnk` shortcut) or `schtasks /Run /tn Tessera`. Then switch the
   takeover on again from the footer.
 
+### Multi-monitor test
+
+Steps to follow by hand on a PC with two monitors:
+
+1. Run `tools\check-health.ps1` and confirm both monitors are listed, with their
+   scales.
+2. Focus a window on monitor 2 and press Win. The menu should open centred on
+   monitor 2 and slide up from behind its taskbar.
+3. Press Win again. The menu should close and focus should return to that window.
+4. Click the Start button on monitor 2's taskbar. The menu should open there.
+5. Focus a window on monitor 2 and press Ctrl+Esc. The menu should open there.
+6. Click the desktop of monitor 2, then press Win. The menu should open on the
+   monitor the pointer is on.
+7. Repeat Win on monitor 1 to confirm it behaves as before.
+8. If the scales differ, expect slightly soft text on the monitor that doesn't
+   use the primary scale. This is known: per-monitor DPI isn't done.
+9. A taskbar on the top or side of a monitor isn't handled. This is known.
+
 ## Next steps, in priority order
 
-1. **Put it under version control.** Run `git init` (the `.gitignore` is
-   already there) and push to a private repo. Nothing is backed up today.
-2. **Reboot test**, as above.
-3. **Multi-monitor check** on a second monitor, if the user has one.
-4. **Ideas, if asked:**
+1. **Reboot test.** Reboot, sign in, and run `tools\check-health.ps1`. All lines
+   OK means it passed.
+2. **Multi-monitor check** on a second monitor, if the user has one. Follow the
+   "Multi-monitor test" subsection above.
+3. **Ideas, if asked:**
    - Per-monitor DPI awareness, for menus on monitors with a different scaling.
    - Handling taskbars on the top or side of a monitor.
    - Making the tint colour itself (not just its strength) a setting.

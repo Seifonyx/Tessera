@@ -177,3 +177,6 @@ These choices were each measured, so don't undo them:
 `tools\measure-slide.ps1` measures the slide (first move, finish, longest gap
 between frames). Run it before and after any change that touches opening or
 closing.
+
+`tools\check-health.ps1` is a read-only health check (scheduled tasks, processes,
+mutexes and monitors). Run it after signing in; every line should say OK.
