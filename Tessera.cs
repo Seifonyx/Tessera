@@ -382,11 +382,13 @@ namespace Tessera
 
         static readonly string[] JunkNames = { "setup", "install", "updater", "update", "crashpad", "crashreport", "crash_handler", "crashhandler",
             "errorreport", "bugreport", "helper", "elevat", "notification_helper", "redist", "vcredist", "dxsetup", "squirrel", "createdump",
-            "dotnet-install", "_test", "test_" };
+            "dotnet-install", "_test", "test_", "startuptask", "webview", "shellext", "overlayui", "_monitor", "xboxutil",
+            "askpass", "askyesno", "credential-", "native-host", "command-runner", "make-data-folder", "steamservice", "py-manager" };
         static readonly string[] JunkPaths = { "\\node_modules\\", "\\.git\\", "\\site-packages\\", "\\__pycache__\\", "\\$recycle.bin\\",
             "\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\temp\\", "\\tmp\\", "\\winsxs\\", "\\windows\\installer\\",
             "\\package cache\\", "\\_commonredist\\", "\\redist\\", "\\redistributables\\", "\\directx\\", "\\vendor\\",
             "\\.cargo\\registry\\", "\\go\\pkg\\mod\\", "\\.nuget\\", "\\.vscode\\extensions\\", "\\resources\\app\\",
+            "\\usr\\bin\\", "\\usr\\libexec\\", "\\mingw64\\", "\\mingw32\\", "\\git-core\\", "\\steam\\bin\\",
             "\\locales\\", "\\test\\", "\\tests\\", "\\examples\\", "\\samples\\" };
 
         // Installers, uninstallers, helper binaries and library-folder hits. Callers never ask about files the user has launched.
@@ -398,6 +400,7 @@ namespace Tessera
                 string n = System.IO.Path.GetFileNameWithoutExtension(p);
                 if (n.StartsWith("unins") || n.StartsWith("uninst") || n.StartsWith("uninstall")) return true;
                 foreach (var j in JunkNames) if (n.Contains(j)) return true;
+                if (n.StartsWith("git-") && n != "git-bash" && n != "git-cmd" && n != "git-gui" && n != "git-lfs") return true;
                 if (n == "vc_redist.x64" || n == "vc_redist.x86" || n == "dxwebsetup" || n.StartsWith("ndp")) return true;
                 foreach (var j in JunkPaths) if (p.Contains(j)) return true;
                 if (f.Source == 3 && p.Split('\\').Length - 2 > 6) return true;
