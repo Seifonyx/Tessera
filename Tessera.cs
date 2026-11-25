@@ -354,7 +354,7 @@ namespace Tessera
                     else if (c == '_') sb.Append("[_]");
                     else sb.Append(c);
                 }
-                string sql = "SELECT TOP " + max + " System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:' AND System.FileExtension IN ('.exe','.bat','.cmd','.com','.msc') AND System.FileName LIKE '%" + sb.ToString() + "%'";
+                string sql = "SELECT TOP " + max + " System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:' AND (System.FileExtension='.exe' OR System.FileExtension='.bat' OR System.FileExtension='.cmd' OR System.FileExtension='.com' OR System.FileExtension='.msc') AND System.FileName LIKE '%" + sb.ToString() + "%'";
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 using (var conn = new System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"))
                 {
