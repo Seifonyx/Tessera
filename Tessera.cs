@@ -42,6 +42,8 @@ namespace Tessera
         public string Id;
         public IntPtr Pidl;
         public ImageSource Icon;
+        public string Path;     // file-system path; non-null only for file results (never in the apps list)
+        public string Detail;   // right-hand subtitle for file results
     }
 
     // ---------------------------------------------------------------- shell: list apps, icons, launching
@@ -142,7 +144,7 @@ namespace Tessera
         public static int IconUnits = 32;
         public static int IconPx { get { return (int)Math.Round(IconUnits * Scale); } }
 
-        static ImageSource GetIcon(IShellItem item, int size)
+        internal static ImageSource GetIcon(IShellItem item, int size)
         {
             var f = item as IShellItemImageFactory;
             if (f == null) return null;
@@ -194,7 +196,218 @@ namespace Tessera
             t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start();
         }
 
+        // Opens a file or folder with ShellExecuteEx, in the given working directory (null for none).
+        internal static void LaunchFile(string file, string dir, bool admin)
+        {
+            var t = new Thread(() =>
+            {
+                var i = new SHELLEXECUTEINFO();
+                i.cbSize = Marshal.SizeOf(typeof(SHELLEXECUTEINFO));
+                i.fMask = 0x00000400;   // SEE_MASK_FLAG_NO_UI
+                i.lpFile = file; i.lpDirectory = dir; i.nShow = 1;
+                if (admin) i.lpVerb = "runas";
+                ShellExecuteEx(ref i);
+            });
+            t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start();
+        }
+
         public static void Free(List<AppEntry> list) { foreach (var a in list) if (a.Pidl != IntPtr.Zero) Marshal.FreeCoTaskMem(a.Pidl); }
+    }
+
+    // ---------------------------------------------------------------- file search: PATH, App Paths, Windows Search index
+    static class FileSearch
+    {
+        static readonly string[] Exts = { ".exe", ".bat", ".cmd", ".com", ".msc" };
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHCreateItemFromParsingName(string path, IntPtr pbc, [MarshalAs(UnmanagedType.LPStruct)] Guid riid,
+            [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
+
+        static readonly Dictionary<string, ImageSource> iconCache = new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
+
+        public static bool IsExt(string ext)
+        {
+            foreach (var e in Exts) if (string.Equals(e, ext, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        // "build.bat" -> "build"; names whose extension isn't an executable one ("Node.js") are left alone
+        public static string StripExt(string name)
+        {
+            string ext = System.IO.Path.GetExtension(name);
+            return !string.IsNullOrEmpty(ext) && IsExt(ext) ? name.Substring(0, name.Length - ext.Length) : name;
+        }
+
+        static AppEntry Make(string path, string name, string detail)
+        {
+            var e = new AppEntry();
+            e.Path = path; e.Id = path; e.Name = name; e.Detail = detail;
+            return e;
+        }
+
+        static string ParentName(string path)
+        {
+            try { return System.IO.Path.GetFileName(System.IO.Path.GetDirectoryName(path)); } catch { return ""; }
+        }
+
+        // Programs on PATH and App Paths registry entries. Runs on the scan thread.
+        public static List<AppEntry> ScanCommands()
+        {
+            var list = new List<AppEntry>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // PATH: machine + user + this process's copy (Tessera runs for days, so the process copy can be stale)
+            var dirs = new List<string>();
+            var dirSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sources = new List<string>();
+            try { sources.Add(Environment.GetEnvironmentVariable("Path", EnvironmentVariableTarget.Machine)); } catch { }
+            try { sources.Add(Environment.GetEnvironmentVariable("Path", EnvironmentVariableTarget.User)); } catch { }
+            try { sources.Add(Environment.GetEnvironmentVariable("PATH")); } catch { }
+            foreach (var src in sources)
+            {
+                if (string.IsNullOrEmpty(src)) continue;
+                foreach (var part in src.Split(';'))
+                {
+                    try
+                    {
+                        string d = part.Trim().Trim('"').Trim();
+                        if (d.Length == 0) continue;
+                        d = Environment.ExpandEnvironmentVariables(d);
+                        if (d.Length == 0 || !Directory.Exists(d)) continue;
+                        if (dirSeen.Add(d.TrimEnd('\\'))) dirs.Add(d);
+                    }
+                    catch { }
+                }
+            }
+            var pathNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // first directory on PATH wins, like a command prompt
+            foreach (var d in dirs)
+            {
+                try
+                {
+                    foreach (var f in Directory.EnumerateFiles(d))
+                    {
+                        try
+                        {
+                            if (!IsExt(System.IO.Path.GetExtension(f))) continue;
+                            string fn = System.IO.Path.GetFileName(f);
+                            if (!pathNames.Add(fn) || !seen.Add(f)) continue;
+                            list.Add(Make(f, fn, "Command"));
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+
+            // App Paths (what Win+R and the Start search use to find chrome.exe, winword.exe, ...)
+            var hives = new[]
+            {
+                new KeyValuePair<Microsoft.Win32.RegistryHive, Microsoft.Win32.RegistryView>(Microsoft.Win32.RegistryHive.CurrentUser, Microsoft.Win32.RegistryView.Default),
+                new KeyValuePair<Microsoft.Win32.RegistryHive, Microsoft.Win32.RegistryView>(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64),
+                new KeyValuePair<Microsoft.Win32.RegistryHive, Microsoft.Win32.RegistryView>(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry32)
+            };
+            foreach (var h in hives)
+            {
+                try
+                {
+                    using (var bk = Microsoft.Win32.RegistryKey.OpenBaseKey(h.Key, h.Value))
+                    using (var ap = bk.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"))
+                    {
+                        if (ap == null) continue;
+                        foreach (var sub in ap.GetSubKeyNames())
+                        {
+                            try
+                            {
+                                using (var k = ap.OpenSubKey(sub))
+                                {
+                                    if (k == null) continue;
+                                    string v = k.GetValue("") as string;
+                                    if (string.IsNullOrEmpty(v)) continue;
+                                    v = Environment.ExpandEnvironmentVariables(v.Trim().Trim('"').Trim());
+                                    if (v.Length == 0 || !File.Exists(v) || !seen.Add(v)) continue;
+                                    string name = System.IO.Path.GetExtension(sub).Length > 0 ? sub : System.IO.Path.GetFileName(v);
+                                    list.Add(Make(v, name, ParentName(v)));
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+            }
+            return list;
+        }
+
+        // Executable files in the Windows Search index whose file name contains q. Empty on any failure
+        // (Windows Search service off, provider missing, timeout).
+        public static List<AppEntry> QueryIndex(string q, int max)
+        {
+            var list = new List<AppEntry>();
+            try
+            {
+                var sb = new StringBuilder();
+                foreach (char c in q)
+                {
+                    if (c == '\'') sb.Append("''");
+                    else if (c == '[') sb.Append("[[]");
+                    else if (c == '%') sb.Append("[%]");
+                    else if (c == '_') sb.Append("[_]");
+                    else sb.Append(c);
+                }
+                string sql = "SELECT TOP " + max + " System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:' AND System.FileExtension IN ('.exe','.bat','.cmd','.com','.msc') AND System.FileName LIKE '%" + sb.ToString() + "%'";
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                using (var conn = new System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"))
+                {
+                    conn.Open();
+                    using (var cmd = new System.Data.OleDb.OleDbCommand(sql, conn))
+                    {
+                        cmd.CommandTimeout = 3;
+                        using (var rd = cmd.ExecuteReader())
+                        {
+                            while (rd.Read())
+                            {
+                                string p = rd.GetValue(0) as string;
+                                if (string.IsNullOrEmpty(p) || !seen.Add(p)) continue;
+                                try { if (!File.Exists(p)) continue; } catch { continue; }
+                                list.Add(Make(p, System.IO.Path.GetFileName(p), ParentName(p)));
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        public static ImageSource Cached(string path)
+        {
+            ImageSource ic;
+            lock (iconCache) { return iconCache.TryGetValue(path, out ic) ? ic : null; }
+        }
+
+        // Must be called from an STA thread. Null when Windows has no icon for it.
+        public static ImageSource Icon(string path)
+        {
+            var c = Cached(path);
+            if (c != null) return c;
+            IShellItem item = null;
+            try
+            {
+                if (SHCreateItemFromParsingName(path, IntPtr.Zero, typeof(IShellItem).GUID, out item) != 0 || item == null) return null;
+                var ic = Shell.GetIcon(item, Shell.IconPx);
+                if (ic != null) lock (iconCache) iconCache[path] = ic;
+                return ic;
+            }
+            catch { return null; }
+            finally { if (item != null) Marshal.ReleaseComObject(item); }
+        }
+
+        public static void Launch(AppEntry a, bool admin)
+        {
+            string dir = null;
+            try { if (File.Exists(a.Path)) dir = System.IO.Path.GetDirectoryName(a.Path); } catch { }
+            Shell.LaunchFile(a.Path, dir, admin);
+        }
     }
 
     // ---------------------------------------------------------------- categories.txt
@@ -690,6 +903,12 @@ namespace Tessera
         List<AppEntry> viewList;
         List<Border> resultRows = new List<Border>();
         List<AppEntry> results = new List<AppEntry>();
+        List<AppEntry> commands = new List<AppEntry>();      // programs on PATH + App Paths entries, refreshed on every scan
+        List<AppEntry> indexHits = new List<AppEntry>();     // results of the last completed Windows Search index query...
+        string indexQuery = "";                              // ...and the query they belong to
+        volatile int searchGen;
+        bool oleWarmed;
+        HashSet<string> iconFailed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         int sel;
         public bool IsOpen, SuppressHide, Exiting;
         DispatcherTimer watch;
@@ -1025,13 +1244,18 @@ namespace Tessera
             scanning = true;
             var cache = new Dictionary<string, ImageSource>();
             if (!fresh) foreach (var a in apps) if (a.Icon != null && !cache.ContainsKey(a.Id)) cache[a.Id] = a.Icon;
+            bool warm = !oleWarmed; oleWarmed = true;
             var t = new Thread(() =>
             {
                 List<AppEntry> list;
                 try { list = Shell.Enumerate(cache); } catch { list = null; }
+                List<AppEntry> cmds;
+                try { cmds = FileSearch.ScanCommands(); } catch { cmds = null; }
+                if (warm) { try { FileSearch.QueryIndex("tessera-warmup", 1); } catch { } }   // loads OLE DB so the first real search isn't slow
                 Action done = () =>
                 {
                     if (list != null && list.Count > 0) { var old = apps; apps = list; Shell.Free(old); homeDirty = true; }
+                    if (cmds != null) commands = cmds;
                     lastScan = DateTime.Now; scanning = false;
                     if (rescanFresh) { rescanFresh = false; Scan(true, true); }
                 };
@@ -1187,7 +1411,7 @@ namespace Tessera
             });
         }
 
-        void Run(AppEntry a, bool admin) { HideMenu(); Shell.Launch(a, admin); }
+        void Run(AppEntry a, bool admin) { HideMenu(); if (a.Path != null) FileSearch.Launch(a, admin); else Shell.Launch(a, admin); }
 
         // ------------------------------------------------ layout
         void BuildShell()
@@ -1210,7 +1434,7 @@ namespace Tessera
                 Height = 38, Margin = new Thickness(Pad + 4, Pad + 4, Pad + 4, 20) };
             var sg = new Grid();
             sg.Children.Add(new TextBlock { Text = "", FontFamily = IconFont, FontSize = 13, Foreground = Fg2, Margin = new Thickness(15, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center });
-            placeholder = new TextBlock { Text = "Search for apps", Foreground = Fg3, FontSize = 13.5, Margin = new Thickness(42, 0, 16, 1), VerticalAlignment = VerticalAlignment.Center, IsHitTestVisible = false };
+            placeholder = new TextBlock { Text = "Search apps and files", Foreground = Fg3, FontSize = 13.5, Margin = new Thickness(42, 0, 16, 1), VerticalAlignment = VerticalAlignment.Center, IsHitTestVisible = false };
             search = new TextBox { Background = Clear, BorderThickness = new Thickness(0), Foreground = Fg, CaretBrush = Fg, FontSize = 13.5, SelectionBrush = Accent,
                 Margin = new Thickness(40, 0, 16, 1), VerticalContentAlignment = VerticalAlignment.Center, FocusVisualStyle = null };
             search.TextChanged += (s, e) =>
@@ -1705,15 +1929,82 @@ namespace Tessera
             return cm;
         }
 
-        void ShowSearch(string q)
+        class SearchHit { public AppEntry E; public int S; }
+
+        // 0 exact (with or without extension), 1 prefix, 2 word start, 3 contains, -1 no match
+        static int Score(string name, string q)
         {
+            if (name.Equals(q, StringComparison.OrdinalIgnoreCase) || FileSearch.StripExt(name).Equals(q, StringComparison.OrdinalIgnoreCase)) return 0;
+            if (name.StartsWith(q, StringComparison.OrdinalIgnoreCase)) return 1;
+            if (name.IndexOf(" " + q, StringComparison.OrdinalIgnoreCase) >= 0 || name.IndexOf("-" + q, StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("_" + q, StringComparison.OrdinalIgnoreCase) >= 0 || name.IndexOf("." + q, StringComparison.OrdinalIgnoreCase) >= 0) return 2;
+            if (name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) return 3;
+            return -1;
+        }
+
+        void ShowSearch(string q) { ShowSearch(q, false); }
+
+        // keepSel: this is the re-render after the background pass, so keep the user's moved selection on the same entry
+        void ShowSearch(string q, bool keepSel)
+        {
+            AppEntry prev = keepSel && sel != 0 && sel < results.Count ? results[sel] : null;
             view = "search";
             var hidden = new HashSet<AppEntry>(Hidden());
-            results = apps.Where(a => !hidden.Contains(a) && a.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0)
-                .OrderBy(a => a.Name.StartsWith(q, StringComparison.OrdinalIgnoreCase) ? 0 : (a.Name.IndexOf(" " + q, StringComparison.OrdinalIgnoreCase) >= 0 ? 1 : 2))
-                .ThenBy(a => a.Name).Take(40).ToList();
+            var appHits = new List<SearchHit>();
+            foreach (var a in apps)
+            {
+                if (hidden.Contains(a)) continue;
+                int s = Score(a.Name, q);
+                if (s >= 0) appHits.Add(new SearchHit { E = a, S = s });
+            }
+            var fileHits = new List<SearchHit>();
+            foreach (var c in commands)
+            {
+                int s = Score(c.Name, q);
+                if (s == 0 || s == 1) fileHits.Add(new SearchHit { E = c, S = s });
+            }
+            List<AppEntry> ih = null;
+            if (indexQuery == q) ih = indexHits;
+            else if (indexQuery.Length > 0 && q.StartsWith(indexQuery, StringComparison.OrdinalIgnoreCase)) ih = indexHits;
+            if (ih != null)
+                foreach (var c in ih)
+                {
+                    int s = Score(c.Name, q);
+                    if (s >= 0) fileHits.Add(new SearchHit { E = c, S = s });
+                }
+
+            AppEntry typed = null;
+            if (q.IndexOf('\\') >= 0 || q.IndexOf('/') >= 0 || (q.Length >= 2 && char.IsLetter(q[0]) && q[1] == ':'))
+            {
+                try
+                {
+                    string p = Environment.ExpandEnvironmentVariables(q);
+                    if (File.Exists(p) || Directory.Exists(p)) typed = new AppEntry { Name = q, Id = p, Path = p, Detail = "Open" };
+                }
+                catch { }
+            }
+
+            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (typed != null) seenPaths.Add(typed.Path);
+            var all = new List<SearchHit>(appHits);
+            foreach (var h in fileHits)
+            {
+                if (!seenPaths.Add(h.E.Path)) continue;
+                string bare = FileSearch.StripExt(h.E.Name);
+                bool dup = false;
+                foreach (var ah in appHits)
+                {
+                    if (ah.E.Name.Equals(bare, StringComparison.OrdinalIgnoreCase) || (ah.E.Id != null && ah.E.Id.EndsWith("\\" + h.E.Name, StringComparison.OrdinalIgnoreCase))) { dup = true; break; }
+                }
+                if (!dup) all.Add(h);
+            }
+            var ordered = all.OrderBy(h => h.S).ThenBy(h => h.E.Path != null ? 1 : 0).ThenBy(h => h.E.Name).Take(typed != null ? 39 : 40).Select(h => h.E).ToList();
+            if (typed != null) ordered.Insert(0, typed);
+            results = ordered;
+            foreach (var a in results) if (a.Path != null && a.Icon == null) a.Icon = FileSearch.Cached(a.Path);
+
             var sp = new StackPanel { Margin = new Thickness(Pad - 4, 0, Pad - 10, 12) };
-            sp.Children.Add(Header(results.Count == 0 ? "No apps match \"" + q + "\"" : "Best matches", null, null));
+            sp.Children.Add(Header(results.Count == 0 ? "Nothing matches \"" + q + "\"" : "Best matches", null, null));
             resultRows.Clear();
             foreach (var a in results)
             {
@@ -1722,16 +2013,61 @@ namespace Tessera
                 var ic = Icon(a, 26); ic.HorizontalAlignment = HorizontalAlignment.Left;
                 rg.Children.Add(ic);
                 rg.Children.Add(new TextBlock { Text = a.Name, FontSize = 13.5, Margin = new Thickness(42, 0, 120, 0), VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
-                rg.Children.Add(new TextBlock { Text = CategoryOf(a), FontSize = 12, Foreground = Fg3, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center });
+                rg.Children.Add(new TextBlock { Text = a.Path != null ? a.Detail : CategoryOf(a), FontSize = 12, Foreground = Fg3, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center });
                 r.Child = rg;
                 var idx = resultRows.Count;
                 r.MouseEnter += (s, e) => Select(idx);
                 r.MouseLeftButtonUp += (s, e) => Run(a, false);
-                r.ContextMenu = AppMenu(a);
+                if (a.Path != null) { r.ToolTip = a.Path; r.ContextMenu = FileMenu(a); }
+                else r.ContextMenu = AppMenu(a);
                 resultRows.Add(r); sp.Children.Add(r);
             }
             SetPage(Scroll(sp), 0);
-            Select(0);
+            int pick = 0;
+            if (prev != null)
+                for (int k = 0; k < results.Count; k++)
+                    if (prev.Path != null ? string.Equals(results[k].Path, prev.Path, StringComparison.OrdinalIgnoreCase) : ReferenceEquals(results[k], prev)) { pick = k; break; }
+            Select(pick);
+
+            // background pass: ask the Windows Search index for files and fetch icons of file results
+            int gen = ++searchGen;
+            bool needIndex = indexQuery != q && q.Length >= 2;
+            var need = new List<AppEntry>();
+            foreach (var a in results) if (a.Path != null && a.Icon == null && !iconFailed.Contains(a.Path)) need.Add(a);
+            if (needIndex || need.Count > 0) StartSearchPass(q, gen, needIndex, need);
+        }
+
+        void StartSearchPass(string q, int gen, bool needIndex, List<AppEntry> need)
+        {
+            var t = new Thread(() =>
+            {
+                List<AppEntry> hits = null;
+                if (needIndex)
+                {
+                    Thread.Sleep(120);   // let typing settle
+                    if (gen != searchGen) return;
+                    hits = FileSearch.QueryIndex(q, 30);
+                    if (gen != searchGen) return;
+                }
+                var todo = new List<AppEntry>(need);
+                if (hits != null) todo.AddRange(hits);
+                var failed = new List<string>();
+                foreach (var e in todo)
+                {
+                    if (gen != searchGen) return;
+                    if (e.Icon != null) continue;
+                    var ic = FileSearch.Icon(e.Path);
+                    if (ic != null) e.Icon = ic; else failed.Add(e.Path);
+                }
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    foreach (var f in failed) iconFailed.Add(f);
+                    if (gen != searchGen || view != "search" || search.Text.Trim() != q) return;
+                    if (hits != null) { indexQuery = q; indexHits = hits; }
+                    ShowSearch(q, true);
+                }));
+            });
+            t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start();
         }
 
         void Select(int i)
@@ -1773,7 +2109,18 @@ namespace Tessera
             return m;
         }
 
-        static bool CanAdmin(AppEntry a) { return !a.Id.Contains("!") && !a.Id.Contains("://"); }
+        static bool CanAdmin(AppEntry a) { if (a.Path != null) { try { return File.Exists(a.Path); } catch { return false; } } return !a.Id.Contains("!") && !a.Id.Contains("://"); }
+
+        ContextMenu FileMenu(AppEntry a)
+        {
+            var cm = new ContextMenu();
+            cm.Items.Add(MI("Open", () => Run(a, false)));
+            if (CanAdmin(a)) cm.Items.Add(MI("Run as administrator", () => Run(a, true)));
+            cm.Items.Add(new Separator());
+            cm.Items.Add(MI("Open file location", () => { HideMenu(); try { Process.Start("explorer.exe", "/select,\"" + a.Path + "\""); } catch { } }));
+            cm.Items.Add(MI("Copy path", () => { try { Clipboard.SetText(a.Path); } catch { } }));
+            return cm;
+        }
 
         ContextMenu AppMenu(AppEntry a)
         {
