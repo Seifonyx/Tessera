@@ -22,6 +22,15 @@ in it.
   you're working on. The Start button opens it on the monitor of the taskbar
   you clicked.
 - **Search.** Start typing as soon as the menu opens.
+  Search also finds programs on PATH (exact and prefix matches), App Paths registry
+  entries, .exe/.bat/.cmd/.com/.msc files in the Windows Search index, and typed
+  paths. File results show their folder on the right and have Open, Run as
+  administrator, Open file location and Copy path in the right-click menu. Which
+  files Windows indexes depends on its indexed locations (Settings > Privacy &
+  security > Searching Windows).
+  Results are ordered by how often and how recently you launch things, using
+  Windows' own launch history plus Tessera's `usage.txt`; installers, uninstallers,
+  helpers and deep library folders are hidden unless you've launched them.
 - **Windows Start is still there.** The ⊞ button in the footer opens the normal
   Windows Start menu.
 - **Works over admin windows.** A small helper keeps the Windows key working
