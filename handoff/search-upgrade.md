@@ -22,3 +22,7 @@ related query lifts that result (up to 3 tiers).
 
 ## Status
 Implemented in Tessera.cs; see commit.
+
+## Round 2 (2026-11-27)
+Everything (D: indexed as a folder; its NTFS index failed), open-window switching, app keywords + category words, unit/currency conversion, recent files, bookmarks, content search, file ranking by match + recency. Fix: menu closing when Settings grabs focus right after opening (StartWindow.Reclaim).
+

@@ -22,7 +22,9 @@ Read this before searching code. Update it when files are added, moved or remove
 - `Matcher` - search match tiers (exact, prefix, word start, initials, any-order words, contains, fuzzy, typo).
 - `Picks` - learns which result you launch for each typed query (picks.txt, gitignored).
 - `Calc` - calculator answers in the search box.
-- `Extras` - Settings pages catalog, Control Panel items, power actions (lock, sleep, restart...).
+- `Extras` - Settings pages, Control Panel items, power actions, app keywords (+ keywords.txt), open windows, recent files, browser bookmarks.
+- `Everything` - file/program search through voidtools Everything (es.exe) when it runs; Windows index otherwise.
+- `Convert2`, `Rates` - unit and currency conversion (rates cached in rates.txt, gitignored).
 - `UsageInfo`, `Usage` - launch-frequency tracking.
 - `BitTools` - small bit helpers.
 - `Category`, `Config` - categories.txt model and loader.

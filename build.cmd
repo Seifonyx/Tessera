@@ -10,7 +10,7 @@ del /q Tessera.old-*.exe 2>nul
   /win32icon:Tessera.ico /resource:Tessera.ico,Tessera.ico ^
   /r:"%WPF%\PresentationFramework.dll" /r:"%WPF%\PresentationCore.dll" /r:"%WPF%\WindowsBase.dll" ^
   /r:"%WPF%\UIAutomationClient.dll" /r:"%WPF%\UIAutomationTypes.dll" ^
-  /r:System.Xaml.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll /r:System.Data.dll ^
+  /r:System.Xaml.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll /r:System.Data.dll /r:System.Web.Extensions.dll ^
   Tessera.cs
 if errorlevel 1 exit /b 1
 if exist Tessera.exe ren Tessera.exe Tessera.old-%RANDOM%.exe

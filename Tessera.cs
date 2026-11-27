@@ -49,6 +49,10 @@ namespace Tessera
         public string Keywords; // extra words a setting or action is also found by
         public Action Act;      // what an action does when run (Source 6 and 7)
         public bool Strict;     // only found by exact, prefix or word-start matches (power actions)
+        public string IconPath; // file to take the icon from when it isn't Path (open windows: their program)
+        public IntPtr Hwnd;     // open window to switch to (Source 9)
+        public DateTime When;   // last modified / last used, for ordering files
+        // more sources: 9 open window, 10 bookmark, 11 recent file
     }
 
     // ---------------------------------------------------------------- shell: list apps, icons, launching
@@ -348,6 +352,24 @@ namespace Tessera
         public static List<AppEntry> QueryIndex(string q, int max)
         {
             var list = new List<AppEntry>();
+            // Everything first: it sees every drive (games on D:, portable apps), not just indexed folders
+            // (Windows' own folders hold thousands of internal programs; PATH already covers the useful ones there)
+            string win = (Environment.GetEnvironmentVariable("SystemRoot") ?? @"C:\Windows").TrimEnd('\\');
+            var es = Everything.Query("ext:exe;bat;cmd;com;msc " + Everything.Term(q) +
+                " !\"" + win + "\\\" !\\$recycle.bin\\ !\\windowsapps\\ !\\microsoft.net\\ !\"\\common files\\\" !\"\\windows kits\\\" !\\programdata\\ !\\appdata\\local\\temp\\",
+                max * 2);
+            if (es != null)
+            {
+                foreach (var p in es)
+                {
+                    if (list.Count >= max) break;
+                    // only names that start with what you typed (or have a word that does): "browser" shouldn't list ZFGameBrowser.exe
+                    int s = Matcher.Score(System.IO.Path.GetFileName(p), q);
+                    if (s < 0 || s > Matcher.WordStart) continue;
+                    try { if (File.Exists(p)) list.Add(Make(p, System.IO.Path.GetFileName(p), ParentName(p), 3)); } catch { }
+                }
+                return list;
+            }
             try
             {
                 var sb = new StringBuilder();
@@ -455,8 +477,88 @@ namespace Tessera
             "\\$recycle.bin\\", "\\windows\\", "\\program files\\", "\\program files (x86)\\", "\\programdata\\", "\\.vscode\\",
             "\\.cargo\\", "\\.nuget\\", "\\.gradle\\", "\\.m2\\", "\\bin\\", "\\obj\\", "\\.cache\\", "\\steamapps\\", "\\vendor\\" };
 
-        // Documents and folders in the Windows Search index whose name contains every word of q, newest first.
+        static bool DocJunk(string p)
+        {
+            string lp = p.ToLowerInvariant();
+            foreach (var j in DocJunkPaths) if (lp.Contains(j)) return true;
+            return false;
+        }
+
+        static AppEntry DocEntry(string p, string detailPrefix)
+        {
+            bool dir;
+            DateTime when;
+            try
+            {
+                dir = Directory.Exists(p);
+                if (!dir && !File.Exists(p)) return null;
+                when = dir ? Directory.GetLastWriteTime(p) : File.GetLastWriteTime(p);
+            }
+            catch { return null; }
+            string parent = ParentName(p);
+            var e = Make(p, System.IO.Path.GetFileName(p), (detailPrefix ?? (dir ? "Folder · " : "")) + parent, 8);
+            e.When = when;
+            return e;
+        }
+
+        // Documents and folders whose name matches q: Everything when it runs (instant, every drive), else the
+        // Windows Search index. Then, if few matched by name, files whose text contains q (index only).
         public static List<AppEntry> QueryDocs(string q, int max)
+        {
+            var list = new List<AppEntry>();
+            var words = q.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            var es = Everything.Query(string.Join(" ", words.Select(Everything.Term)) +
+                " !ext:exe;dll;lnk;sys;tmp;log;dat;pf;mui;cat;manifest;etl;db-wal;db-shm;json;xml;ini;cache" +
+                " !\\appdata\\ !\\windows\\ !\"\\program files\" !\\programdata\\ !\\$recycle.bin\\ !\\node_modules\\ !\\.git\\ !\\steamapps\\ !\\winget\\",
+                max * 6);
+            if (es != null)
+            {
+                foreach (var p in es)
+                {
+                    if (DocJunk(p)) continue;
+                    var e = DocEntry(p, null);
+                    if (e != null) list.Add(e);
+                }
+            }
+            else list = IndexDocs(q, max * 3);
+            if (list.Count < max && q.Length >= 4) list.AddRange(ContentDocs(q, max - list.Count, list));
+            return list;
+        }
+
+        // Files under your user folder whose contents contain q (Windows Search indexes document text).
+        static List<AppEntry> ContentDocs(string q, int max, List<AppEntry> have)
+        {
+            var list = new List<AppEntry>();
+            try
+            {
+                var seen = new HashSet<string>(have.Select(h => h.Path), StringComparer.OrdinalIgnoreCase);
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string phrase = q.Replace("\"", "").Replace("'", "''");
+                string sql = "SELECT TOP " + (max * 3) + " System.ItemPathDisplay FROM SystemIndex WHERE SCOPE='file:" + home.Replace("'", "''") +
+                    "' AND CONTAINS(*, '\"" + phrase + "*\"') AND System.FileExtension<>'.exe' AND System.FileExtension<>'.lnk' ORDER BY System.Search.Rank DESC";
+                using (var conn = new System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"))
+                {
+                    conn.Open();
+                    using (var cmd = new System.Data.OleDb.OleDbCommand(sql, conn))
+                    {
+                        cmd.CommandTimeout = 3;
+                        using (var rd = cmd.ExecuteReader())
+                            while (rd.Read() && list.Count < max)
+                            {
+                                string p = rd.GetValue(0) as string;
+                                if (string.IsNullOrEmpty(p) || !seen.Add(p) || DocJunk(p)) continue;
+                                var e = DocEntry(p, "Contains \"" + q + "\" · ");
+                                if (e != null) { e.Keywords = "\u0001content"; list.Add(e); }
+                            }
+                    }
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        // Documents and folders in the Windows Search index whose name contains every word of q, newest first.
+        static List<AppEntry> IndexDocs(string q, int max)
         {
             var list = new List<AppEntry>();
             try
@@ -481,15 +583,9 @@ namespace Tessera
                             while (rd.Read() && list.Count < max)
                             {
                                 string p = rd.GetValue(0) as string;
-                                if (string.IsNullOrEmpty(p) || !seen.Add(p)) continue;
-                                string lp = p.ToLowerInvariant();
-                                bool junk = false;
-                                foreach (var j in DocJunkPaths) if (lp.Contains(j)) { junk = true; break; }
-                                if (junk) continue;
-                                bool dir;
-                                try { dir = Directory.Exists(p); if (!dir && !File.Exists(p)) continue; } catch { continue; }
-                                string parent = ParentName(p);
-                                list.Add(Make(p, System.IO.Path.GetFileName(p), dir ? "Folder · " + parent : parent, 8));
+                                if (string.IsNullOrEmpty(p) || !seen.Add(p) || DocJunk(p)) continue;
+                                var e = DocEntry(p, null);
+                                if (e != null) list.Add(e);
                             }
                         }
                     }
@@ -666,7 +762,9 @@ namespace Tessera
                 {
                     string kw = k.Trim();
                     if (kw.Length == 0) continue;
+                    if (kw[0] == '\u0001') continue;   // a marker, not a word
                     int ks = a.Strict ? StrictScore(kw, q) : Score(kw, q);
+                    if (ks > WordStart && !(q.Length >= 5 && ks == Typo)) continue;   // loose keyword matches are mostly noise
                     if (ks >= 0) { ks = Math.Min(Typo, ks + 1); if (s < 0 || ks < s) s = ks; }
                 }
             return s;
@@ -1018,6 +1116,453 @@ namespace Tessera
             l.Add(A("Sign out", "log out,logout,log off,logoff,sign off", "signout", () => Run("shutdown.exe", "/l")));
             l.Add(A("Empty Recycle Bin", "recycle bin,trash,empty trash", "emptybin", () => SHEmptyRecycleBin(IntPtr.Zero, null, 0)));   // Windows asks first
             return l;
+        }
+
+        // Words an app is also found by ("browser" -> Brave). Built in for common apps; keywords.txt next to
+        // Tessera.exe adds your own, one "App name = word, word" per line.
+        static readonly string[] BuiltInKeywords = {
+            "Brave=browser,web,internet", "Microsoft Edge=browser,web,internet", "Google Chrome=browser,web,internet", "Firefox=browser,web,internet",
+            "Spotify=music,songs,player,playlist", "iTunes=music,songs", "Media Player=music,video,player", "Windows Media Player Legacy=music,video,player",
+            "Discord=chat,voice,messages", "WhatsApp=chat,messages,texts", "Phone Link=phone,texts,sms", "TikTok=videos,social",
+            "Netflix=movies,tv,shows,series", "Steam=games,store", "Epic Games Launcher=games,store", "Game Bar=xbox,record,screenshot",
+            "Notepad=text,editor,txt", "Sticky Notes=notes,memo", "Notes=notes", "Obsidian=notes,markdown,vault", "Notion=notes,docs,wiki",
+            "Terminal=console,shell,command line,cmd", "Command Prompt=cmd,console,shell", "Windows PowerShell=shell,console,command line",
+            "Git Bash=shell,bash,console", "Ubuntu=linux,bash,wsl", "WSL=linux,bash,ubuntu",
+            "File Explorer=files,folders,explorer,browse", "Task Manager=processes,performance,kill,cpu,memory,ram",
+            "Calculator=calc,math", "Snipping Tool=screenshot,screen capture,snip,print screen", "Paint=draw,image editor",
+            "Photos=pictures,images,gallery", "Camera=webcam", "Calendar=schedule,events,agenda", "Clock=timer,alarm,stopwatch",
+            "Microsoft Store=store,apps,install", "Registry Editor=regedit,registry", "Control Panel=cpl,classic settings",
+            "Sound Recorder=voice recorder,record audio,mic", "Character Map=symbols,special characters,unicode",
+            "Mail=email,inbox", "Gmail=email,mail,inbox", "Settings=preferences,options,config", "Event Viewer=logs,errors",
+            "Services=services.msc", "Disk Cleanup=clean,free space,junk", "Proton VPN=vpn", "Windscribe=vpn", "PrivadoVPN=vpn",
+            "hide.me VPN=vpn", "Cloudflare One Client=vpn,warp", "ChatGPT=ai,chat,gpt", "Claude=ai,chat,assistant",
+            "Task Scheduler=scheduled tasks,cron", "Lively Wallpaper=wallpaper,background,live wallpaper", "EarTrumpet=volume,audio,sound",
+            "Rainmeter=widgets,skins", "Windhawk=mods,tweaks", "Resource Monitor=network,disk,cpu", "Performance Monitor=perfmon",
+            "System Information=specs,msinfo,hardware", "Computer Management=disk management,devices", "Remote Desktop Connection=rdp,mstsc",
+            "Quick Assist=remote help", "Magnifier=zoom", "On-Screen Keyboard=osk,keyboard", "Visual Studio Code=vscode,code,editor",
+            "GitHub Desktop=git,repo", "Python 3.14=python,py", "IDLE (Python 3.14)=python,py", "Roblox Player=roblox,games",
+            "AutoHotkey Dash=ahk,macro,hotkeys", "TinyTask=macro,record", "Macro Creator=macro", "BlurAutoClicker=auto clicker,clicker",
+            "TreeSize Free=disk space,folder size", "Autoruns=startup", "WinAuth=2fa,authenticator,otp", "Lenovo Vantage=drivers,battery,updates",
+            "AMD Software=gpu,graphics,drivers,radeon", "Realtek Audio Console=audio,sound,speakers", "Dolby Access=audio,dolby atmos",
+            "X-Mouse Button Control=mouse buttons", "Study Planner=study,school,homework", "Weight Tracker=weight,fitness,health",
+        };
+
+        public static Dictionary<string, string> AppKeywords()
+        {
+            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            Action<string> add = line =>
+            {
+                int eq = line.IndexOf('=');
+                if (eq <= 0 || line.TrimStart().StartsWith("#")) return;
+                string name = line.Substring(0, eq).Trim(), kw = line.Substring(eq + 1).Trim();
+                if (name.Length == 0 || kw.Length == 0) return;
+                string cur;
+                d[name] = d.TryGetValue(name, out cur) ? cur + "," + kw : kw;
+            };
+            foreach (var l in BuiltInKeywords) add(l);
+            try
+            {
+                string f = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "keywords.txt");
+                if (File.Exists(f)) foreach (var l in File.ReadAllLines(f)) add(l);
+            }
+            catch { }
+            return d;
+        }
+
+        // ------------------------------------------------ open windows (switch instead of starting a second copy)
+        delegate bool EnumProc(IntPtr h, IntPtr l);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+        [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
+        [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr p, int flags, StringBuilder s, ref int n);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+
+        static string ProcessPath(uint pid)
+        {
+            IntPtr p = OpenProcess(0x1000, false, pid);   // PROCESS_QUERY_LIMITED_INFORMATION
+            if (p == IntPtr.Zero) return null;
+            try { var sb = new StringBuilder(1024); int n = sb.Capacity; return QueryFullProcessImageName(p, 0, sb, ref n) ? sb.ToString() : null; }
+            finally { CloseHandle(p); }
+        }
+
+        // Top-level windows you can see in Alt+Tab, except Tessera's own.
+        public static List<AppEntry> Windows()
+        {
+            var list = new List<AppEntry>();
+            uint me = (uint)Process.GetCurrentProcess().Id;
+            var names = new Dictionary<uint, string[]>();
+            EnumWindows((h, l) =>
+            {
+                try
+                {
+                    if (!IsWindowVisible(h) || GetWindow(h, 4) != IntPtr.Zero) return true;            // GW_OWNER
+                    int ex = GetWindowLong(h, -20);
+                    if ((ex & 0x80) != 0 && (ex & 0x40000) == 0) return true;                       // tool window, not app window
+                    int cloaked; if (DwmGetWindowAttribute(h, 14, out cloaked, 4) == 0 && cloaked != 0) return true;
+                    var t = new StringBuilder(512); GetWindowText(h, t, 512);
+                    string title = t.ToString().Trim();
+                    if (title.Length == 0) return true;
+                    var c = new StringBuilder(256); GetClassName(h, c, 256);
+                    string cls = c.ToString();
+                    if (cls == "Progman" || cls == "Shell_TrayWnd" || cls == "Windows.UI.Core.CoreWindow") return true;
+                    uint pid; GetWindowThreadProcessId(h, out pid);
+                    if (pid == me) return true;
+                    string[] info;
+                    if (!names.TryGetValue(pid, out info))
+                    {
+                        string path = ProcessPath(pid), desc = null;
+                        try { if (path != null) desc = FileVersionInfo.GetVersionInfo(path).FileDescription; } catch { }
+                        string pname = path != null ? System.IO.Path.GetFileNameWithoutExtension(path) : "";
+                        info = new[] { path, string.IsNullOrWhiteSpace(desc) ? pname : desc.Trim(), pname };
+                        names[pid] = info;
+                    }
+                    bool frame = info[2].Equals("ApplicationFrameHost", StringComparison.OrdinalIgnoreCase);
+                    string app = frame ? title : info[1];
+                    list.Add(new AppEntry { Name = title, Keywords = app + "," + info[2], Id = "window:" + h, Hwnd = h, Source = 9,
+                        Detail = "Switch to · " + app, IconPath = frame ? null : info[0] });
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+            return list;
+        }
+
+        public static void Activate(IntPtr h)
+        {
+            if (IsIconic(h)) ShowWindow(h, 9);   // SW_RESTORE
+            SetForegroundWindow(h);
+        }
+
+        // ------------------------------------------------ recent files (what Explorer's Recent list has)
+        public static List<AppEntry> RecentFiles(int max)
+        {
+            var list = new List<AppEntry>();
+            try
+            {
+                string dir = Environment.GetFolderPath(Environment.SpecialFolder.Recent);
+                var files = new DirectoryInfo(dir).GetFiles("*.lnk").OrderByDescending(f => f.LastWriteTimeUtc).Take(max * 2).ToList();
+                var sh = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var f in files)
+                {
+                    if (list.Count >= max) break;
+                    try
+                    {
+                        object lnk = sh.GetType().InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, sh, new object[] { f.FullName });
+                        string target = lnk.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty, null, lnk, null) as string;
+                        Marshal.ReleaseComObject(lnk);
+                        if (string.IsNullOrEmpty(target) || !seen.Add(target)) continue;
+                        bool isDir = Directory.Exists(target);
+                        if (!isDir && !File.Exists(target)) continue;
+                        string ext = System.IO.Path.GetExtension(target);
+                        if (FileSearch.IsExt(ext)) continue;
+                        string parent = "";
+                        try { parent = System.IO.Path.GetFileName(System.IO.Path.GetDirectoryName(target)); } catch { }
+                        list.Add(new AppEntry { Path = target, Id = target, Name = System.IO.Path.GetFileName(target), Source = 11,
+                            Detail = (isDir ? "Recent folder · " : "Recent · ") + parent, When = f.LastWriteTime });
+                    }
+                    catch { }
+                }
+                Marshal.ReleaseComObject(sh);
+            }
+            catch { }
+            return list;
+        }
+
+        // ------------------------------------------------ browser bookmarks (Brave, Edge, Chrome)
+        public static List<AppEntry> Bookmarks()
+        {
+            var list = new List<AppEntry>();
+            string la = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var browsers = new[] {
+                new[] { "Brave", @"BraveSoftware\Brave-Browser\User Data" },
+                new[] { "Edge", @"Microsoft\Edge\User Data" },
+                new[] { "Chrome", @"Google\Chrome\User Data" } };
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var b in browsers)
+            {
+                try
+                {
+                    string root = System.IO.Path.Combine(la, b[1]);
+                    if (!Directory.Exists(root)) continue;
+                    foreach (var prof in Directory.GetDirectories(root))
+                    {
+                        string f = System.IO.Path.Combine(prof, "Bookmarks");
+                        if (!File.Exists(f)) continue;
+                        var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                        var doc = ser.DeserializeObject(File.ReadAllText(f)) as Dictionary<string, object>;
+                        if (doc == null || !doc.ContainsKey("roots")) continue;
+                        var roots = doc["roots"] as Dictionary<string, object>;
+                        if (roots == null) continue;
+                        foreach (var r in roots.Values) Walk(r, b[0], list, seen);
+                    }
+                }
+                catch { }
+            }
+            return list;
+        }
+
+        static void Walk(object node, string browser, List<AppEntry> list, HashSet<string> seen)
+        {
+            var d = node as Dictionary<string, object>;
+            if (d == null || list.Count > 3000) return;
+            object type, url, name, kids;
+            d.TryGetValue("type", out type);
+            if ((type as string) == "url" && d.TryGetValue("url", out url) && d.TryGetValue("name", out name))
+            {
+                string u = url as string, n = (name as string ?? "").Trim();
+                if (string.IsNullOrEmpty(u) || !(u.StartsWith("http://") || u.StartsWith("https://")) || !seen.Add(u)) return;
+                string host = "";
+                try { host = new Uri(u).Host; if (host.StartsWith("www.")) host = host.Substring(4); } catch { }
+                list.Add(new AppEntry { Name = n.Length > 0 ? n : host, Keywords = host, Path = u, Id = u, Source = 10, Detail = "Bookmark · " + host });
+                return;
+            }
+            if (d.TryGetValue("children", out kids))
+            {
+                var arr = kids as object[];
+                if (arr != null) foreach (var k in arr) Walk(k, browser, list, seen);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- Everything (voidtools): instant file search when installed
+    static class Everything
+    {
+        static string es;
+        static DateTime checkedAt;
+
+        static string Es()
+        {
+            if ((DateTime.UtcNow - checkedAt).TotalSeconds < 60) return es;
+            checkedAt = DateTime.UtcNow; es = null;
+            try
+            {
+                if (Process.GetProcessesByName("Everything").Length == 0) return null;   // its index lives in that process
+                string la = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                var cands = new List<string> { System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "es.exe"),
+                    @"C:\Program Files\Everything\es.exe", System.IO.Path.Combine(la, @"Microsoft\WinGet\Links\es.exe") };
+                string pk = System.IO.Path.Combine(la, @"Microsoft\WinGet\Packages");
+                if (Directory.Exists(pk))
+                    foreach (var d in Directory.GetDirectories(pk, "voidtools.Everything.Cli*")) cands.Add(System.IO.Path.Combine(d, "es.exe"));
+                foreach (var c in cands) if (File.Exists(c)) { es = c; break; }
+            }
+            catch { }
+            return es;
+        }
+
+        public static bool Available { get { return Es() != null; } }
+
+        // Full paths for an Everything search, newest first. Null when Everything isn't there or fails.
+        public static List<string> Query(string search, int max)
+        {
+            string exe = Es();
+            if (exe == null) return null;
+            string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "tessera-es-" + Thread.CurrentThread.ManagedThreadId + ".txt");
+            try
+            {
+                var psi = new ProcessStartInfo(exe, "-n " + max + " -sort date-modified-descending -export-txt \"" + tmp + "\" " + search)
+                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                using (var p = Process.Start(psi))
+                {
+                    if (!p.WaitForExit(1500)) { try { p.Kill(); } catch { } return null; }
+                    if (p.ExitCode != 0) return null;
+                }
+                var r = new List<string>();
+                foreach (var l in File.ReadAllLines(tmp, Encoding.UTF8)) { string s = l.Trim(); if (s.Length > 0) r.Add(s); }
+                return r;
+            }
+            catch { return null; }
+            finally { try { File.Delete(tmp); } catch { } }
+        }
+
+        // quotes a typed word for Everything's search syntax
+        public static string Term(string w) { return "\"" + w.Replace("\"", "") + "\""; }
+    }
+
+    // ---------------------------------------------------------------- unit and currency conversion ("5 km in miles", "100 usd to egp")
+    static class Convert2
+    {
+        // unit -> (kind, factor to the base unit)
+        static readonly Dictionary<string, KeyValuePair<string, double>> U = new Dictionary<string, KeyValuePair<string, double>>(StringComparer.OrdinalIgnoreCase);
+        static void Add(string kind, double f, params string[] names) { foreach (var n in names) U[n] = new KeyValuePair<string, double>(kind, f); }
+        static Convert2()
+        {
+            Add("len", 0.001, "mm", "millimeter", "millimeters", "millimetre", "millimetres");
+            Add("len", 0.01, "cm", "centimeter", "centimeters", "centimetre", "centimetres");
+            Add("len", 1, "m", "meter", "meters", "metre", "metres");
+            Add("len", 1000, "km", "kilometer", "kilometers", "kilometre", "kilometres");
+            Add("len", 0.0254, "in", "inch", "inches", "\"");
+            Add("len", 0.3048, "ft", "foot", "feet", "'");
+            Add("len", 0.9144, "yd", "yard", "yards");
+            Add("len", 1609.344, "mi", "mile", "miles");
+            Add("len", 1852, "nmi", "nautical mile", "nautical miles");
+            Add("mass", 0.001, "mg", "milligram", "milligrams");
+            Add("mass", 1, "g", "gram", "grams");
+            Add("mass", 1000, "kg", "kilo", "kilos", "kilogram", "kilograms");
+            Add("mass", 1e6, "t", "ton", "tons", "tonne", "tonnes");
+            Add("mass", 453.59237, "lb", "lbs", "pound", "pounds");
+            Add("mass", 28.349523125, "oz", "ounce", "ounces");
+            Add("mass", 6350.29318, "st", "stone", "stones");
+            Add("vol", 0.001, "ml", "milliliter", "milliliters", "millilitre", "millilitres");
+            Add("vol", 1, "l", "liter", "liters", "litre", "litres");
+            Add("vol", 3.785411784, "gal", "gallon", "gallons");
+            Add("vol", 0.946352946, "qt", "quart", "quarts");
+            Add("vol", 0.473176473, "pt", "pint", "pints");
+            Add("vol", 0.2365882365, "cup", "cups");
+            Add("vol", 0.0295735296, "floz", "fl oz", "fluid ounce", "fluid ounces");
+            Add("vol", 0.0147867648, "tbsp", "tablespoon", "tablespoons");
+            Add("vol", 0.00492892159, "tsp", "teaspoon", "teaspoons");
+            Add("data", 1, "b", "byte", "bytes");
+            Add("data", 1000, "kb", "kilobyte", "kilobytes");
+            Add("data", 1e6, "mb", "megabyte", "megabytes");
+            Add("data", 1e9, "gb", "gigabyte", "gigabytes");
+            Add("data", 1e12, "tb", "terabyte", "terabytes");
+            Add("data", 1024, "kib");
+            Add("data", 1048576, "mib");
+            Add("data", 1073741824, "gib");
+            Add("data", 1099511627776, "tib");
+            Add("time", 0.001, "ms", "millisecond", "milliseconds");
+            Add("time", 1, "s", "sec", "secs", "second", "seconds");
+            Add("time", 60, "min", "mins", "minute", "minutes");
+            Add("time", 3600, "h", "hr", "hrs", "hour", "hours");
+            Add("time", 86400, "d", "day", "days");
+            Add("time", 604800, "wk", "week", "weeks");
+            Add("time", 31557600, "yr", "year", "years");
+            Add("speed", 1, "m/s", "mps");
+            Add("speed", 1 / 3.6, "km/h", "kmh", "kph");
+            Add("speed", 0.44704, "mph");
+            Add("speed", 0.514444, "kn", "knot", "knots");
+            Add("area", 1, "m2", "sqm", "m²");
+            Add("area", 1e6, "km2", "km²");
+            Add("area", 0.09290304, "ft2", "sqft", "ft²");
+            Add("area", 4046.8564224, "acre", "acres");
+            Add("area", 10000, "ha", "hectare", "hectares");
+            Add("temp", 1, "c", "°c", "celsius");
+            Add("temp", 1, "f", "°f", "fahrenheit");
+            Add("temp", 1, "k", "kelvin");
+        }
+
+        static readonly System.Text.RegularExpressions.Regex Rx = new System.Text.RegularExpressions.Regex(
+            @"^\s*(-?[\d,]*\.?\d+)\s*([a-z°²/""' ]+?)\s+(?:in|to|as|=|->)\s+([a-z°²/""' ]+?)\s*$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        // "5 km in miles" -> "3.107 mi"; currencies need Rates. Null when q isn't a conversion.
+        public static string Try(string q, out bool needRates)
+        {
+            needRates = false;
+            var m = Rx.Match(q ?? "");
+            if (!m.Success) return null;
+            double v;
+            if (!double.TryParse(m.Groups[1].Value.Replace(",", ""), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v)) return null;
+            string a = m.Groups[2].Value.Trim(), b = m.Groups[3].Value.Trim();
+            KeyValuePair<string, double> ua, ub;
+            if (U.TryGetValue(a, out ua) && U.TryGetValue(b, out ub))
+            {
+                if (ua.Key != ub.Key) return null;
+                double r = ua.Key == "temp" ? Temp(v, a.ToLowerInvariant().Trim('°'), b.ToLowerInvariant().Trim('°')) : v * ua.Value / ub.Value;
+                return Fmt(r) + " " + b;
+            }
+            if (a.Length == 3 && b.Length == 3 && a.All(char.IsLetter) && b.All(char.IsLetter))
+            {
+                double ra, rb;
+                if (!Rates.TryGet(a, out ra) || !Rates.TryGet(b, out rb)) { needRates = !Rates.Loaded; return needRates ? "" : null; }
+                return Fmt(v / ra * rb, 2) + " " + b.ToUpperInvariant();
+            }
+            return null;
+        }
+
+        static double Temp(double v, string a, string b)
+        {
+            a = a.Substring(0, 1); b = b.Substring(0, 1);
+            double c = a == "c" ? v : a == "f" ? (v - 32) * 5 / 9 : v - 273.15;
+            return b == "c" ? c : b == "f" ? c * 9 / 5 + 32 : c + 273.15;
+        }
+
+        static string Fmt(double r) { return Fmt(r, Math.Abs(r) >= 100 ? 2 : Math.Abs(r) >= 1 ? 4 : 6); }
+        static string Fmt(double r, int dec)
+        {
+            if (Math.Abs(r) >= 1e15 || (r != 0 && Math.Abs(r) < 1e-6)) return r.ToString("G6", System.Globalization.CultureInfo.InvariantCulture);
+            return Math.Round(r, dec).ToString("#,0." + new string('#', dec), System.Globalization.CultureInfo.InvariantCulture);
+        }
+    }
+
+    // Exchange rates (per US dollar) from open.er-api.com, cached in rates.txt for 12 hours. Only currency codes go out.
+    static class Rates
+    {
+        static Dictionary<string, double> rates;
+        static DateTime fetched;
+        static int loading;
+        static string FilePath { get { return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "rates.txt"); } }
+
+        public static bool Loaded { get { return rates != null; } }
+
+        public static bool TryGet(string code, out double r)
+        {
+            r = 0;
+            if (rates == null) LoadFile();
+            if (rates == null || (DateTime.UtcNow - fetched).TotalHours > 12) Refresh(null);
+            return rates != null && rates.TryGetValue(code.ToUpperInvariant(), out r);
+        }
+
+        static void LoadFile()
+        {
+            try
+            {
+                if (!File.Exists(FilePath)) return;
+                var lines = File.ReadAllLines(FilePath);
+                long t; if (lines.Length < 2 || !long.TryParse(lines[0], out t)) return;
+                var d = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 1; i < lines.Length; i++)
+                {
+                    var p = lines[i].Split('=');
+                    double v;
+                    if (p.Length == 2 && double.TryParse(p[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v)) d[p[0]] = v;
+                }
+                fetched = new DateTime(t, DateTimeKind.Utc); rates = d;
+            }
+            catch { }
+        }
+
+        // Downloads fresh rates on a side thread, then calls done (on that thread) if anything changed.
+        public static void Refresh(Action done)
+        {
+            if (Interlocked.Exchange(ref loading, 1) == 1) return;
+            var th = new Thread(() =>
+            {
+                try
+                {
+                    System.Net.ServicePointManager.SecurityProtocol |= System.Net.SecurityProtocolType.Tls12;
+                    string json;
+                    using (var wc = new System.Net.WebClient()) { wc.Headers["User-Agent"] = "Tessera"; json = wc.DownloadString("https://open.er-api.com/v6/latest/USD"); }
+                    var doc = new System.Web.Script.Serialization.JavaScriptSerializer().DeserializeObject(json) as Dictionary<string, object>;
+                    var r = doc != null && doc.ContainsKey("rates") ? doc["rates"] as Dictionary<string, object> : null;
+                    if (r != null && r.Count > 10)
+                    {
+                        var d = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                        var sb = new StringBuilder(); sb.Append(DateTime.UtcNow.Ticks).Append("\r\n");
+                        foreach (var kv in r)
+                        {
+                            double v = System.Convert.ToDouble(kv.Value, System.Globalization.CultureInfo.InvariantCulture);
+                            d[kv.Key] = v; sb.Append(kv.Key).Append('=').Append(v.ToString("R", System.Globalization.CultureInfo.InvariantCulture)).Append("\r\n");
+                        }
+                        rates = d; fetched = DateTime.UtcNow;
+                        try { File.WriteAllText(FilePath, sb.ToString()); } catch { }
+                        if (done != null) done();
+                    }
+                }
+                catch { }
+                finally { Interlocked.Exchange(ref loading, 0); }
+            });
+            th.IsBackground = true; th.Start();
         }
     }
 
@@ -1708,6 +2253,11 @@ namespace Tessera
         List<AppEntry> controlPanel = new List<AppEntry>();  // Control Panel items, refreshed on every scan
         readonly List<AppEntry> settingPages = Extras.Settings();
         readonly List<AppEntry> actions = Extras.Actions();
+        List<AppEntry> recentFiles = new List<AppEntry>();   // Explorer's Recent list, refreshed on every scan
+        List<AppEntry> bookmarks = new List<AppEntry>();     // browser bookmarks, refreshed on every scan
+        Dictionary<string, string> appKeywords = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        List<AppEntry> openWindows = new List<AppEntry>();   // windows you can switch to, read once per opening
+        bool windowsStale = true;
         volatile int searchGen;
         bool oleWarmed;
         HashSet<string> iconFailed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1779,7 +2329,7 @@ namespace Tessera
             Resources.MergedDictionaries.Add((ResourceDictionary)XamlReader.Parse(Styles.Xaml));
             BuildShell();
             SourceInitialized += (s, e) => InitNative();
-            Deactivated += (s, e) => { if (!SuppressHide && IsOpen) { autoHidAt = DateTime.UtcNow; HideMenu(); } };
+            Deactivated += (s, e) => { if (!SuppressHide && IsOpen) { if (Reclaim()) return; autoHidAt = DateTime.UtcNow; HideMenu(); } };
             Closing += (s, e) => { if (!Exiting) { e.Cancel = true; HideMenu(true); } };
             PreviewKeyDown += OnKey;
             // letters typed while the menu is still sliding in go straight into the search
@@ -1794,7 +2344,7 @@ namespace Tessera
             {   // safety net: hide if another app took focus without us getting a Deactivated event
                 if (!IsOpen || SuppressHide) return;
                 uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
-                if (pid != (uint)Process.GetCurrentProcess().Id) { autoHidAt = DateTime.UtcNow; HideMenu(); }
+                if (pid != (uint)Process.GetCurrentProcess().Id) { if (Reclaim()) return; autoHidAt = DateTime.UtcNow; HideMenu(); }
             };
             Scan(false);
 
@@ -2055,6 +2605,10 @@ namespace Tessera
                 try { cmds = FileSearch.ScanCommands(); } catch { cmds = null; }
                 List<AppEntry> cpl;
                 try { cpl = Extras.ControlPanel(cache); } catch { cpl = null; }
+                List<AppEntry> recent = null, bms = null; Dictionary<string, string> kws = null;
+                try { recent = Extras.RecentFiles(80); } catch { }
+                try { bms = Extras.Bookmarks(); } catch { }
+                try { kws = Extras.AppKeywords(); } catch { }
                 Dictionary<string, UsageInfo> usg;
                 try { Usage.Reload(); usg = Usage.Snapshot(); } catch { usg = null; }
                 if (warm) { try { FileSearch.QueryIndex("tessera-warmup", 1); } catch { } }   // loads OLE DB so the first real search isn't slow
@@ -2063,6 +2617,10 @@ namespace Tessera
                     if (list != null && list.Count > 0) { var old = apps; apps = list; Shell.Free(old); homeDirty = true; }
                     if (cmds != null) commands = cmds;
                     if (cpl != null && cpl.Count > 0) { var oldC = controlPanel; controlPanel = cpl; Shell.Free(oldC); }
+                    if (recent != null) recentFiles = recent;
+                    if (bms != null) bookmarks = bms;
+                    if (kws != null) appKeywords = kws;
+                    foreach (var a in apps) { string k; a.Keywords = appKeywords.TryGetValue(a.Name, out k) ? k : null; }
                     if (usg != null) usage = usg;
                     lastScan = DateTime.Now; scanning = false;
                     if (rescanFresh) { rescanFresh = false; Scan(true, true); }
@@ -2132,7 +2690,7 @@ namespace Tessera
         void ShowMenu(bool keyboard)
         {
             if (IsOpen) return;
-            IsOpen = true;
+            IsOpen = true; openedAt = DateTime.UtcNow; reclaims = 0; windowsStale = true;
             var before = GetForegroundWindow();
             if (before != hwnd) prevFg = before;   // where the keyboard goes back to if the menu is closed without opening anything
             if (parked || !IsVisible)
@@ -2184,6 +2742,31 @@ namespace Tessera
         public static void Log(string m) { try { File.AppendAllText(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug.log"), DateTime.Now.ToString("HH:mm:ss.fff ") + m + "\r\n"); } catch { } }
 
         IntPtr prevFg;
+        DateTime openedAt; int reclaims;
+
+        // Some apps (Windows Settings, other ApplicationFrameHost apps, apps still starting up) take the foreground back
+        // a moment after the menu opened, which used to close it straight away. Within the first second, if the
+        // window that grabbed focus is the one the menu was opened over, take focus back instead (a few times at most).
+        bool Reclaim()
+        {
+            if ((DateTime.UtcNow - openedAt).TotalMilliseconds > 1200 || reclaims >= 3) return false;
+            var fg = GetForegroundWindow();
+            if (fg == hwnd) return true;
+            uint fpid, ppid;
+            GetWindowThreadProcessId(fg, out fpid);
+            GetWindowThreadProcessId(prevFg, out ppid);
+            bool sameApp = fg == prevFg || (ppid != 0 && fpid == ppid) || IsFrameHost(fpid);
+            if (!sameApp) return false;
+            reclaims++;
+            Dispatcher.BeginInvoke(new Action(() => { if (IsOpen) ForceForeground(); }));
+            return true;
+        }
+
+        static bool IsFrameHost(uint pid)
+        {
+            try { var n = Process.GetProcessById((int)pid).ProcessName; return n.Equals("ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) || n.Equals("SystemSettings", StringComparison.OrdinalIgnoreCase); }
+            catch { return false; }
+        }
 
         // returnFocus: closed with nothing else to go to (Win key, Esc, Start button...): give the keyboard back to the
         // window that had it before the menu opened, like Windows' Start does. Otherwise it would stay on this (now
@@ -2258,6 +2841,7 @@ namespace Tessera
 
         void Run(AppEntry a, bool admin)
         {
+            if (a.Source == 9) { HideMenu(); var h = a.Hwnd; ThreadPool.QueueUserWorkItem(_ => Extras.Activate(h)); return; }
             if (view == "search" && a.Source != 7 && a.Source != 4)
             {
                 string q = search.Text.Trim(), key = a.Path ?? a.Id;
@@ -2809,7 +3393,8 @@ namespace Tessera
         double h_rank(SearchHit h, double use)
         {
             var e = h.E;
-            double kind = e.Source == 0 ? 0 : e.Source == 5 ? (e.Path != null ? 0.6 : 0.8) : e.Source == 6 ? 1.0 : 0.5;
+            double kind = e.Source == 0 ? 0 : e.Source == 9 ? -0.2 : e.Source == 5 ? (e.Path != null ? 0.6 : 0.8)
+                : e.Source == 6 ? 1.0 : e.Source == 10 ? 0.9 : 0.5;
             double pick;
             string key = (e.Path ?? e.Id ?? "").ToLowerInvariant();
             if (!pickBonus.TryGetValue(key, out pick)) pick = 0;
@@ -2825,6 +3410,9 @@ namespace Tessera
 
         static string GlyphFor(AppEntry a)
         {
+            if (a.Source == 9) return "";                      // window
+            if (a.Source == 10) return "";                     // bookmark star
+            if (a.Id == "convert") return "";                  // conversion
             if (a.Source == 7) return "";                      // search
             if (a.Id == "calc") return "";                     // calculator
             switch (a.Id)
@@ -2863,7 +3451,13 @@ namespace Tessera
             foreach (var a in apps)
             {
                 if (hidden.Contains(a)) continue;
-                int s = Score(a.Name, q);
+                int s = Matcher.ScoreWithKeywords(a, q);       // name, then words like "browser" for Brave
+                string cat = CategoryOf(a);                     // and its category: "games" lists your games
+                if (cat != "Other")
+                {
+                    int cs = Score(cat, q);
+                    if (cs >= 0 && cs <= Matcher.WordStart && (s < 0 || cs + 2 < s)) s = cs + 2;
+                }
                 if (s >= 0) appHits.Add(new SearchHit { E = a, S = s });
             }
             // settings pages, Control Panel items and power actions, ranked with the apps; one row per name
@@ -2875,6 +3469,17 @@ namespace Tessera
                 if (s < 0 || !appNames.Add(NormName(a.Name))) continue;
                 appHits.Add(new SearchHit { E = a, S = s });
             }
+            // open windows: typing "disc" offers to switch to the Discord you already have open
+            if (windowsStale) { try { openWindows = Extras.Windows(); } catch { openWindows = new List<AppEntry>(); } windowsStale = false; }
+            foreach (var h in openWindows
+                .Select(w => new SearchHit { E = w, S = Matcher.ScoreWithKeywords(w, q) })
+                .Where(h => h.S >= 0 && h.S <= Matcher.Contains).OrderBy(h => h.S).Take(4).ToList())
+                appHits.Add(h);
+            // bookmarks: close matches only (there can be thousands)
+            foreach (var h in bookmarks
+                .Select(b => new SearchHit { E = b, S = Matcher.ScoreWithKeywords(b, q) })
+                .Where(h => h.S >= 0 && h.S <= Matcher.AllWords).OrderBy(h => h.S).ThenBy(h => h.E.Name.Length).Take(4).ToList())
+                appHits.Add(h);
             // fuzzy and typo matches only when the close ones are few, so they never crowd out real hits
             int close = appHits.Count(h => h.S <= Matcher.Contains);
             if (close >= 3) appHits.RemoveAll(h => h.S >= Matcher.Typo);
@@ -2956,32 +3561,54 @@ namespace Tessera
             var ordered = orderedHits.OrderBy(x => x.Key).ThenBy(x => x.Value.E.Name).Take(typed != null ? 29 : 30).Select(x => x.Value.E).ToList();
             if (typed != null) ordered.Insert(0, typed);
 
-            // calculator answer goes first: typing "12*7" means you want 84, not an app with 12 in its name
+            // calculator or conversion answer goes first: typing "12*7" means you want 84, not an app with 12 in its name
             string answer = Calc.TryEval(q);
-            if (answer != null)
+            bool needRates = false;
+            string conv = answer == null ? Convert2.Try(q, out needRates) : null;
+            if (needRates) Rates.Refresh(() => Dispatcher.BeginInvoke(new Action(() => { if (view == "search" && search.Text.Trim() == q) ShowSearch(q, true); })));
+            if (answer != null || !string.IsNullOrEmpty(conv))
             {
-                string copy = answer.Replace(",", "");
-                ordered.Insert(0, new AppEntry { Name = "= " + answer, Id = "calc", Detail = "Enter copies it", Source = 6,
+                string shown = answer != null ? "= " + answer : "= " + conv;
+                string copy = (answer ?? conv.Split(' ')[0]).Replace(",", "");
+                ordered.Insert(0, new AppEntry { Name = shown, Id = answer != null ? "calc" : "convert", Detail = "Enter copies it", Source = 6,
                     Act = () => { try { Clipboard.SetText(copy); } catch { } } });
             }
+            else if (needRates)
+                ordered.Insert(0, new AppEntry { Name = "Getting exchange rates…", Id = "convert", Detail = "", Source = 6, Act = () => { } });
 
-            // documents and folders from the index, in their own section (newest first)
+            // documents and folders (Everything or the index) plus recent files, in their own section
             var docs = new List<AppEntry>();
-            if (q.Length >= 3 && docQuery.Length > 0 && (docQuery == q || q.StartsWith(docQuery, StringComparison.OrdinalIgnoreCase)))
+            if (q.Length >= 2)
             {
                 var words = q.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                foreach (var d in docHits)
+                var docSeen = new HashSet<string>(seenPaths, StringComparer.OrdinalIgnoreCase);
+                var docRanked = new List<KeyValuePair<double, AppEntry>>();
+                var recentSet = new HashSet<string>(recentFiles.Select(r => r.Path), StringComparer.OrdinalIgnoreCase);
+                Action<AppEntry> consider = d =>
                 {
-                    if (seenPaths.Contains(d.Path)) continue;
-                    bool every = true;
-                    foreach (var w in words) if (d.Name.IndexOf(w, StringComparison.OrdinalIgnoreCase) < 0) { every = false; break; }
-                    if (every) docs.Add(d);
-                }
-                docs = docs.OrderByDescending(d => UsageOf(d)).Take(6).ToList();
+                    if (d.Path == null || !docSeen.Add(d.Path)) return;
+                    bool content = d.Keywords != null && d.Keywords.StartsWith("\u0001");
+                    int s;
+                    if (content) { if (docQuery != q) return; s = Matcher.Fuzzy; }
+                    else
+                    {
+                        s = Score(d.Name, q);
+                        if (s < 0 || s >= Matcher.Fuzzy) return;
+                        if (words.Length > 1) foreach (var w in words) if (d.Name.IndexOf(w, StringComparison.OrdinalIgnoreCase) < 0 && Score(d.Name, w) < 0) return;
+                    }
+                    double age = d.When == default(DateTime) ? 999 : (DateTime.Now - d.When).TotalDays;
+                    double fresh = age <= 2 ? 0.8 : age <= 7 ? 0.6 : age <= 30 ? 0.35 : age <= 180 ? 0.1 : 0;
+                    double pk; pickBonus.TryGetValue(d.Path.ToLowerInvariant(), out pk);
+                    double rank = s - fresh - UsageOf(d) - pk - (recentSet.Contains(d.Path) ? 0.6 : 0);
+                    docRanked.Add(new KeyValuePair<double, AppEntry>(rank, d));
+                };
+                foreach (var d in recentFiles) consider(d);
+                if (q.Length >= 3 && docQuery.Length > 0 && (docQuery == q || q.StartsWith(docQuery, StringComparison.OrdinalIgnoreCase)))
+                    foreach (var d in docHits) consider(d);
+                docs = docRanked.OrderBy(x => x.Key).ThenBy(x => x.Value.Name).Take(6).Select(x => x.Value).ToList();
             }
             int docStart = ordered.Count;
             ordered.AddRange(docs);
-
             // and always a way out: search the web for it
             string url = (Set != null ? Set.WebSearch : "https://www.google.com/search?q=%s").Replace("%s", Uri.EscapeDataString(q));
             string host = "the web";
@@ -2991,7 +3618,7 @@ namespace Tessera
                 Act = () => Shell.LaunchFile(url, null, false) });
 
             results = ordered;
-            foreach (var a in results) if (a.Path != null && a.Icon == null) a.Icon = FileSearch.Cached(FileSearch.IconSource(a.Path));
+            foreach (var a in results) if ((a.Path != null || a.IconPath != null) && a.Icon == null && a.Source != 10) a.Icon = FileSearch.Cached(a.IconPath ?? FileSearch.IconSource(a.Path));
 
             var sp = new StackPanel { Margin = new Thickness(Pad - 4, 0, Pad - 10, 12) };
             sp.Children.Add(Header(webAt == 0 ? "Nothing on this PC matches \"" + q + "\"" : "Best matches", null, null));
@@ -3002,7 +3629,7 @@ namespace Tessera
                 if (ri == docStart && docs.Count > 0) sp.Children.Add(Header("Files & folders", null, null));
                 var r = new Border { Height = 46, CornerRadius = new CornerRadius(6), Background = Clear, Padding = new Thickness(12, 0, 14, 0) };
                 var rg = new Grid();
-                if (a.Icon == null && (a.Source == 6 || a.Source == 7)) rg.Children.Add(Glyph(GlyphFor(a), 26));
+                if (a.Icon == null && (a.Source == 6 || a.Source == 7 || a.Source == 9 || a.Source == 10)) rg.Children.Add(Glyph(GlyphFor(a), 26));
                 else { var ic = Icon(a, 26); ic.HorizontalAlignment = HorizontalAlignment.Left; rg.Children.Add(ic); }
                 rg.Children.Add(new TextBlock { Text = a.Name, FontSize = 13.5, Margin = new Thickness(42, 0, 140, 0), VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
                 rg.Children.Add(new TextBlock { Text = a.Path != null || a.Source >= 5 ? a.Detail : CategoryOf(a), FontSize = 12, Foreground = Fg3, MaxWidth = 130, TextTrimming = TextTrimming.CharacterEllipsis, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center });
@@ -3010,7 +3637,7 @@ namespace Tessera
                 var idx = resultRows.Count;
                 r.MouseEnter += (s, e) => Select(idx);
                 r.MouseLeftButtonUp += (s, e) => Run(a, false);
-                if (a.Source >= 5 && a.Source <= 7) { if (a.Path != null) r.ToolTip = a.Path; }
+                if ((a.Source >= 5 && a.Source <= 7) || a.Source == 9 || a.Source == 10) { if (a.Path != null) r.ToolTip = a.Path; }
                 else if (a.Path != null) { r.ToolTip = a.Path; r.ContextMenu = FileMenu(a); }
                 else r.ContextMenu = AppMenu(a);
                 resultRows.Add(r); sp.Children.Add(r);
@@ -3025,9 +3652,9 @@ namespace Tessera
             // background pass: ask the Windows Search index for files and fetch icons of file results
             int gen = ++searchGen;
             bool needIndex = indexQuery != q && q.Length >= 2;
-            bool needDocs = docQuery != q && q.Length >= 3 && answer == null;
+            bool needDocs = docQuery != q && q.Length >= 3 && answer == null && string.IsNullOrEmpty(conv) && !needRates;
             var need = new List<AppEntry>();
-            foreach (var a in results) if (a.Path != null && a.Icon == null && !iconFailed.Contains(a.Path)) need.Add(a);
+            foreach (var a in results) { string ip = a.IconPath ?? a.Path; if (ip != null && a.Icon == null && a.Source != 10 && !iconFailed.Contains(ip)) need.Add(a); }
             if (needIndex || needDocs || need.Count > 0) StartSearchPass(q, gen, needIndex, needDocs, need);
         }
 
@@ -3059,8 +3686,9 @@ namespace Tessera
                 {
                     if (gen != searchGen) return;
                     if (e.Icon != null) continue;
-                    var ic = FileSearch.Icon(FileSearch.IconSource(e.Path));
-                    if (ic != null) e.Icon = ic; else failed.Add(e.Path);
+                    string ip = e.IconPath ?? FileSearch.IconSource(e.Path);
+                    var ic = FileSearch.Icon(ip);
+                    if (ic != null) e.Icon = ic; else failed.Add(e.IconPath ?? e.Path);
                 }
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
