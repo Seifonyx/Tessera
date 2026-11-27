@@ -44,7 +44,11 @@ namespace Tessera
         public ImageSource Icon;
         public string Path;     // file-system path; non-null only for file results (never in the apps list)
         public string Detail;   // right-hand subtitle for file results
-        public int Source;      // 0 app, 1 PATH, 2 App Paths, 3 search index, 4 typed path
+        public int Source;      // 0 app, 1 PATH, 2 App Paths, 3 search index, 4 typed path,
+                                // 5 setting / Control Panel item, 6 action (calculator, power), 7 web search, 8 document or folder
+        public string Keywords; // extra words a setting or action is also found by
+        public Action Act;      // what an action does when run (Source 6 and 7)
+        public bool Strict;     // only found by exact, prefix or word-start matches (power actions)
     }
 
     // ---------------------------------------------------------------- shell: list apps, icons, launching
@@ -438,6 +442,583 @@ namespace Tessera
             try { if (File.Exists(a.Path)) dir = System.IO.Path.GetDirectoryName(a.Path); } catch { }
             Shell.LaunchFile(a.Path, dir, admin);
         }
+
+        // Settings pages have no file to take an icon from; they all use the Settings app's icon.
+        public static string IconSource(string path)
+        {
+            if (path != null && path.StartsWith("ms-settings:", StringComparison.OrdinalIgnoreCase))
+                return Environment.ExpandEnvironmentVariables(@"%SystemRoot%\ImmersiveControlPanel\SystemSettings.exe");
+            return path;
+        }
+
+        static readonly string[] DocJunkPaths = { "\\appdata\\", "\\node_modules\\", "\\.git\\", "\\site-packages\\", "\\__pycache__\\",
+            "\\$recycle.bin\\", "\\windows\\", "\\program files\\", "\\program files (x86)\\", "\\programdata\\", "\\.vscode\\",
+            "\\.cargo\\", "\\.nuget\\", "\\.gradle\\", "\\.m2\\", "\\bin\\", "\\obj\\", "\\.cache\\", "\\steamapps\\", "\\vendor\\" };
+
+        // Documents and folders in the Windows Search index whose name contains every word of q, newest first.
+        public static List<AppEntry> QueryDocs(string q, int max)
+        {
+            var list = new List<AppEntry>();
+            try
+            {
+                var conds = new List<string>();
+                foreach (var w in q.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                    conds.Add("System.FileName LIKE '%" + Like(w) + "%'");
+                if (conds.Count == 0) return list;
+                string sql = "SELECT TOP " + (max * 4) + " System.ItemPathDisplay, System.ItemType FROM SystemIndex WHERE SCOPE='file:' AND " +
+                    string.Join(" AND ", conds) +
+                    " AND System.FileExtension<>'.exe' AND System.FileExtension<>'.dll' AND System.FileExtension<>'.lnk' AND System.FileExtension<>'.sys'" +
+                    " ORDER BY System.DateModified DESC";
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                using (var conn = new System.Data.OleDb.OleDbConnection("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';"))
+                {
+                    conn.Open();
+                    using (var cmd = new System.Data.OleDb.OleDbCommand(sql, conn))
+                    {
+                        cmd.CommandTimeout = 3;
+                        using (var rd = cmd.ExecuteReader())
+                        {
+                            while (rd.Read() && list.Count < max)
+                            {
+                                string p = rd.GetValue(0) as string;
+                                if (string.IsNullOrEmpty(p) || !seen.Add(p)) continue;
+                                string lp = p.ToLowerInvariant();
+                                bool junk = false;
+                                foreach (var j in DocJunkPaths) if (lp.Contains(j)) { junk = true; break; }
+                                if (junk) continue;
+                                bool dir;
+                                try { dir = Directory.Exists(p); if (!dir && !File.Exists(p)) continue; } catch { continue; }
+                                string parent = ParentName(p);
+                                list.Add(Make(p, System.IO.Path.GetFileName(p), dir ? "Folder · " + parent : parent, 8));
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        static string Like(string q)
+        {
+            var sb = new StringBuilder();
+            foreach (char c in q)
+            {
+                if (c == '\'') sb.Append("''");
+                else if (c == '[') sb.Append("[[]");
+                else if (c == '%') sb.Append("[%]");
+                else if (c == '_') sb.Append("[_]");
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+    }
+
+    // ---------------------------------------------------------------- search matching
+    // Tiers, lower is better: 0 exact, 1 prefix, 2 a word starts with it, 3 initials ("vsc", "ps" for PowerShell),
+    // 4 every typed word starts a word in any order, 5 contains, 6 letters in order ("chrm"), 7 a typo or two. -1 no match.
+    static class Matcher
+    {
+        public const int Exact = 0, Prefix = 1, WordStart = 2, Initials = 3, AllWords = 4, Contains = 5, Fuzzy = 6, Typo = 7;
+
+        // Words of a name: split at spaces and punctuation, at lower->Upper ("PowerShell") and letter<->digit changes.
+        public static List<string> Words(string s)
+        {
+            var words = new List<string>();
+            var cur = new StringBuilder();
+            char prev = '\0';
+            foreach (char c in s)
+            {
+                if (!char.IsLetterOrDigit(c)) { if (cur.Length > 0) { words.Add(cur.ToString()); cur.Clear(); } prev = c; continue; }
+                bool split = cur.Length > 0 && ((char.IsUpper(c) && char.IsLower(prev)) || (char.IsDigit(c) != char.IsDigit(prev)));
+                if (split) { words.Add(cur.ToString()); cur.Clear(); }
+                cur.Append(c); prev = c;
+            }
+            if (cur.Length > 0) words.Add(cur.ToString());
+            return words;
+        }
+
+        static string Squash(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (char c in s) if (char.IsLetterOrDigit(c)) sb.Append(char.ToLowerInvariant(c));
+            return sb.ToString();
+        }
+
+        public static int Score(string name, string q)
+        {
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(q)) return -1;
+            var ic = StringComparison.OrdinalIgnoreCase;
+            string bare = FileSearch.StripExt(name);
+            if (name.Equals(q, ic) || bare.Equals(q, ic)) return Exact;
+            string sn = Squash(bare), sq = Squash(q);
+            if (sq.Length > 0 && sn == sq) return Exact;
+            if (name.StartsWith(q, ic) || (sq.Length > 0 && sn.StartsWith(sq))) return Prefix;
+            if (name.IndexOf(" " + q, ic) >= 0 || name.IndexOf("-" + q, ic) >= 0 || name.IndexOf("_" + q, ic) >= 0
+                || name.IndexOf("." + q, ic) >= 0 || name.IndexOf("(" + q, ic) >= 0) return WordStart;
+            var words = Words(bare);
+            foreach (var w in words) if (w.StartsWith(q, ic)) return WordStart;
+            if (sq.Length >= 2 && sq.Length == q.Length && words.Count >= 2)
+            {
+                var ini = new StringBuilder();
+                foreach (var w in words) ini.Append(char.ToLowerInvariant(w[0]));
+                if (ini.ToString().Contains(sq)) return Initials;
+                if (InitialsPlus(words, sq)) return Initials;
+            }
+            var qw = q.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (qw.Length >= 2)
+            {
+                bool all = true;
+                foreach (var t in qw)
+                {
+                    bool hit = false;
+                    foreach (var w in words) if (w.StartsWith(t, ic)) { hit = true; break; }
+                    if (!hit) { all = false; break; }
+                }
+                if (all) return AllWords;
+            }
+            if (name.IndexOf(q, ic) >= 0 || (sq.Length >= 3 && sn.Contains(sq))) return Contains;
+            if (sq.Length >= 3 && InOrder(sn, sq, words)) return Fuzzy;
+            if (sq.Length >= 4 && Typos(sn, words, sq)) return Typo;
+            return -1;
+        }
+
+        // "vscode": first letters of some words, then the rest of the last word ("vsco" -> Visual Studio COde)
+        static bool InitialsPlus(List<string> words, string sq)
+        {
+            for (int split = 1; split < sq.Length; split++)
+            {
+                string ini = sq.Substring(0, split), rest = sq.Substring(split);
+                for (int start = 0; start + split <= words.Count; start++)
+                {
+                    bool ok = true;
+                    for (int k = 0; k < split - 1 && ok; k++) ok = char.ToLowerInvariant(words[start + k][0]) == ini[k];
+                    if (!ok) continue;
+                    string last = words[start + split - 1].ToLowerInvariant();
+                    if (last[0] == ini[split - 1] && last.StartsWith(ini[split - 1] + rest)) return true;
+                }
+            }
+            return false;
+        }
+
+        // every typed letter appears in order, the first one at a word start, without huge gaps
+        static bool InOrder(string sn, string sq, List<string> words)
+        {
+            bool startOk = false;
+            foreach (var w in words) if (char.ToLowerInvariant(w[0]) == sq[0]) { startOk = true; break; }
+            if (!startOk) return false;
+            int best = int.MaxValue;
+            for (int s = sn.IndexOf(sq[0]); s >= 0; s = sn.IndexOf(sq[0], s + 1))
+            {
+                int i = s, j = 0;
+                while (i < sn.Length && j < sq.Length) { if (sn[i] == sq[j]) j++; i++; }
+                if (j == sq.Length) best = Math.Min(best, i - s);
+            }
+            return best != int.MaxValue && best <= sq.Length * 2 + 2;
+        }
+
+        // a slip of one letter (two for long words): against the start of the name or of any word
+        static bool Typos(string sn, List<string> words, string sq)
+        {
+            int allowed = sq.Length >= 8 ? 2 : 1;
+            var targets = new List<string> { sn };
+            foreach (var w in words) if (w.Length >= 3) targets.Add(w.ToLowerInvariant());
+            foreach (var t in targets)
+            {
+                if (Math.Abs(t.Length - sq.Length) <= allowed && Distance(t, sq, allowed) <= allowed) return true;   // whole word
+                if (t.Length > sq.Length)
+                {
+                    for (int len = sq.Length - allowed; len <= sq.Length + allowed; len++)                          // its start
+                        if (len >= 3 && len <= t.Length && Distance(t.Substring(0, len), sq, allowed) <= allowed) return true;
+                }
+            }
+            return false;
+        }
+
+        // Damerau-Levenshtein (adjacent swaps count as one), giving up past max
+        public static int Distance(string a, string b, int max)
+        {
+            if (Math.Abs(a.Length - b.Length) > max) return max + 1;
+            var d = new int[a.Length + 1, b.Length + 1];
+            for (int i = 0; i <= a.Length; i++) d[i, 0] = i;
+            for (int j = 0; j <= b.Length; j++) d[0, j] = j;
+            for (int i = 1; i <= a.Length; i++)
+            {
+                int rowMin = int.MaxValue;
+                for (int j = 1; j <= b.Length; j++)
+                {
+                    int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    int v = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+                    if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) v = Math.Min(v, d[i - 2, j - 2] + 1);
+                    d[i, j] = v; rowMin = Math.Min(rowMin, v);
+                }
+                if (rowMin > max) return max + 1;
+            }
+            return d[a.Length, b.Length];
+        }
+
+        // Best tier over the name and the extra keywords (keywords count one tier worse than the name).
+        public static int ScoreWithKeywords(AppEntry a, string q)
+        {
+            int s = a.Strict ? StrictScore(a.Name, q) : Score(a.Name, q);
+            if (!string.IsNullOrEmpty(a.Keywords))
+                foreach (var k in a.Keywords.Split(','))
+                {
+                    string kw = k.Trim();
+                    if (kw.Length == 0) continue;
+                    int ks = a.Strict ? StrictScore(kw, q) : Score(kw, q);
+                    if (ks >= 0) { ks = Math.Min(Typo, ks + 1); if (s < 0 || ks < s) s = ks; }
+                }
+            return s;
+        }
+
+        static int StrictScore(string name, string q)
+        {
+            if (q.Length < 2) return -1;
+            int s = Score(name, q);
+            return s >= 0 && s <= WordStart ? s : -1;
+        }
+    }
+
+    // ---------------------------------------------------------------- learned picks: which result you launched for what you typed
+    static class Picks
+    {
+        class Pick { public string Query, Key; public int Count; public DateTime Last; }
+        static readonly object gate = new object();
+        static List<Pick> list;
+        static string FilePath { get { return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "picks.txt"); } }
+
+        static void Load()
+        {
+            if (list != null) return;
+            list = new List<Pick>();
+            try
+            {
+                if (!File.Exists(FilePath)) return;
+                foreach (var line in File.ReadAllLines(FilePath))
+                {
+                    var p = line.Split('\t');
+                    if (p.Length < 4) continue;
+                    int n; long t;
+                    if (!int.TryParse(p[2], out n) || !long.TryParse(p[3], out t)) continue;
+                    list.Add(new Pick { Query = p[0], Key = p[1], Count = n, Last = new DateTime(t, DateTimeKind.Utc) });
+                }
+            }
+            catch { }
+        }
+
+        public static void Record(string query, string key)
+        {
+            if (string.IsNullOrEmpty(query) || string.IsNullOrEmpty(key)) return;
+            query = query.Trim().ToLowerInvariant(); key = key.ToLowerInvariant();
+            if (query.Length == 0 || query.IndexOf('\t') >= 0) return;
+            lock (gate)
+            {
+                Load();
+                Pick hit = null;
+                foreach (var p in list) if (p.Query == query && p.Key == key) { hit = p; break; }
+                if (hit == null) { hit = new Pick { Query = query, Key = key }; list.Add(hit); }
+                hit.Count++; hit.Last = DateTime.UtcNow;
+                if (list.Count > 2000) list = list.OrderByDescending(x => x.Last).Take(1500).ToList();
+                try
+                {
+                    var sb = new StringBuilder();
+                    foreach (var p in list) sb.Append(p.Query).Append('\t').Append(p.Key).Append('\t').Append(p.Count).Append('\t').Append(p.Last.Ticks).Append("\r\n");
+                    File.WriteAllText(FilePath, sb.ToString());
+                }
+                catch { }
+            }
+        }
+
+        // Bonus in tiers (0-3) for results launched before from this query or a related one ("chr" -> "chrome").
+        public static Dictionary<string, double> Bonuses(string query)
+        {
+            var r = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            query = (query ?? "").Trim().ToLowerInvariant();
+            if (query.Length == 0) return r;
+            lock (gate)
+            {
+                Load();
+                foreach (var p in list)
+                {
+                    double w = p.Query == query ? 1.0 : (p.Query.StartsWith(query) || query.StartsWith(p.Query)) ? 0.5 : 0;
+                    if (w == 0) continue;
+                    double age = (DateTime.UtcNow - p.Last).TotalDays;
+                    double fade = age <= 30 ? 1 : age <= 120 ? 0.6 : 0.3;
+                    double b = w * fade * Math.Min(3.0, 1.2 + Math.Log(p.Count, 2) * 0.6);
+                    double cur;
+                    r[p.Key] = Math.Min(3.0, (r.TryGetValue(p.Key, out cur) ? cur : 0) + b);
+                }
+            }
+            return r;
+        }
+    }
+
+    // ---------------------------------------------------------------- calculator for the search box
+    static class Calc
+    {
+        // A result when q is arithmetic ("12*7", "2^10", "sqrt(2)", "15% of 80", "(3+4)/2"), else null.
+        public static string TryEval(string q)
+        {
+            if (string.IsNullOrWhiteSpace(q)) return null;
+            string s = q.Trim().ToLowerInvariant();
+            if (s.StartsWith("=")) s = s.Substring(1);
+            bool digit = false, op = false;
+            foreach (char c in s) { if (char.IsDigit(c)) digit = true; if ("+-*/^%x×÷(".IndexOf(c) >= 0) op = true; }
+            if (!digit) return null;
+            if (!op && !s.Contains("sqrt") && !s.Contains("pi")) return null;
+            s = s.Replace(" of ", "*").Replace("×", "*").Replace("÷", "/").Replace(",", "");
+            try
+            {
+                var p = new Parser(s);
+                double v = p.Expr();
+                p.Skip();
+                if (p.Pos != s.Length || double.IsNaN(v) || double.IsInfinity(v)) return null;
+                double r = Math.Round(v, 10);
+                if (Math.Abs(r) >= 1e15 || (r != 0 && Math.Abs(r) < 1e-6)) return v.ToString("G10", System.Globalization.CultureInfo.InvariantCulture);
+                return r.ToString("#,0.##########", System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch { return null; }
+        }
+
+        class Parser
+        {
+            readonly string s; public int Pos;
+            public Parser(string text) { s = text; }
+            public void Skip() { while (Pos < s.Length && s[Pos] == ' ') Pos++; }
+            bool Eat(char c) { Skip(); if (Pos < s.Length && s[Pos] == c) { Pos++; return true; } return false; }
+
+            public double Expr()
+            {
+                double v = Term();
+                while (true) { if (Eat('+')) v += Term(); else if (Eat('-')) v -= Term(); else return v; }
+            }
+            double Term()
+            {
+                double v = Power();
+                while (true)
+                {
+                    if (Eat('*') || Eat('x')) v *= Power();
+                    else if (Eat('/')) { double d = Power(); if (d == 0) throw new DivideByZeroException(); v /= d; }
+                    else if (Eat('%'))
+                    {
+                        Skip();
+                        if (Pos < s.Length && (char.IsDigit(s[Pos]) || s[Pos] == '(' || s[Pos] == '.')) v %= Power();   // 10 % 3
+                        else v /= 100;                                                                                   // 15% (of)
+                    }
+                    else return v;
+                }
+            }
+            double Power() { double b = Unary(); if (Eat('^')) return Math.Pow(b, Power()); return b; }
+            double Unary() { if (Eat('-')) return -Unary(); if (Eat('+')) return Unary(); return Atom(); }
+            double Atom()
+            {
+                Skip();
+                if (Eat('(')) { double v = Expr(); if (!Eat(')')) throw new FormatException(); return v; }
+                if (Pos < s.Length && char.IsLetter(s[Pos]))
+                {
+                    int st = Pos; while (Pos < s.Length && char.IsLetter(s[Pos])) Pos++;
+                    string f = s.Substring(st, Pos - st);
+                    if (f == "pi") return Math.PI;
+                    if (f == "e") return Math.E;
+                    if (!Eat('(')) throw new FormatException();
+                    double a = Expr(); if (!Eat(')')) throw new FormatException();
+                    switch (f)
+                    {
+                        case "sqrt": return Math.Sqrt(a);
+                        case "abs": return Math.Abs(a);
+                        case "sin": return Math.Sin(a * Math.PI / 180);
+                        case "cos": return Math.Cos(a * Math.PI / 180);
+                        case "tan": return Math.Tan(a * Math.PI / 180);
+                        case "log": return Math.Log10(a);
+                        case "ln": return Math.Log(a);
+                        case "round": return Math.Round(a);
+                        case "floor": return Math.Floor(a);
+                        case "ceil": return Math.Ceiling(a);
+                    }
+                    throw new FormatException();
+                }
+                int start = Pos;
+                while (Pos < s.Length && (char.IsDigit(s[Pos]) || s[Pos] == '.')) Pos++;
+                if (Pos == start) throw new FormatException();
+                return double.Parse(s.Substring(start, Pos - start), System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- settings pages, Control Panel items, power actions
+    static class Extras
+    {
+        // name | keywords | ms-settings page
+        static readonly string[] SettingPages = {
+            "Display|screen,monitor,resolution,brightness,scale,night light,hdr|display",
+            "Night light|blue light,warm,display|nightlight",
+            "Sound|audio,volume,speakers,microphone,output,input|sound",
+            "Volume mixer|app volume,audio,sound|apps-volume",
+            "Notifications|alerts,do not disturb,focus|notifications",
+            "Focus|focus assist,do not disturb|quiethours",
+            "Power & battery|battery,power mode,sleep,screen timeout,energy saver|powersleep",
+            "Battery saver|energy saver,power|batterysaver",
+            "Storage|disk,space,cleanup,storage sense|storagesense",
+            "Multitasking|snap,alt tab,virtual desktops|multitasking",
+            "Clipboard|clipboard history,copy,paste|clipboard",
+            "Remote Desktop|rdp,remote|remotedesktop",
+            "About this PC|system info,specs,pc name,rename pc,windows version,about|about",
+            "Activation|product key,license,windows activation|activation",
+            "Troubleshoot|troubleshooter,fix problems|troubleshoot",
+            "Recovery|reset this pc,reset,advanced startup|recovery",
+            "Bluetooth & devices|bluetooth,devices,pair|bluetooth",
+            "Printers & scanners|printer,scanner,print|printers",
+            "Mouse|pointer,cursor speed,scroll|mousetouchpad",
+            "Touchpad|trackpad,gestures|devices-touchpad",
+            "Typing|autocorrect,keyboard,spell check|typing",
+            "Pen & Windows Ink|pen,stylus|pen",
+            "AutoPlay|autoplay,usb|autoplay",
+            "USB|usb devices|usb",
+            "Phone Link|phone,mobile|mobile-devices",
+            "Network & internet|network,internet,ethernet,connection|network",
+            "Wi-Fi|wifi,wireless,wlan|network-wifi",
+            "Ethernet|wired,lan,cable|network-ethernet",
+            "VPN|vpn|network-vpn",
+            "Mobile hotspot|hotspot,tethering|network-mobilehotspot",
+            "Airplane mode|flight mode|network-airplanemode",
+            "Proxy|proxy server|network-proxy",
+            "Advanced network settings|network adapter,reset network|network-advancedsettings",
+            "Personalization|personalize,customize,appearance|personalization",
+            "Background|wallpaper,desktop background|personalization-background",
+            "Colors|accent color,dark mode,light mode,theme color,transparency|personalization-colors",
+            "Themes|theme,desktop icons|themes",
+            "Lock screen|lockscreen,screen saver|lockscreen",
+            "Start|start menu|personalization-start",
+            "Taskbar|taskbar,system tray|taskbar",
+            "Fonts|font,typeface|fonts",
+            "Installed apps|uninstall,remove program,apps,programs,add remove programs|appsfeatures",
+            "Default apps|default browser,open with,file associations|defaultapps",
+            "Startup apps|startup,autostart,launch at login|startupapps",
+            "Optional features|features,add feature|optionalfeatures",
+            "Offline maps|maps|maps",
+            "Video playback|video,hdr video|videoplayback",
+            "Accounts|account,microsoft account,profile|yourinfo",
+            "Sign-in options|password,pin,windows hello,fingerprint,face|signinoptions",
+            "Email & accounts|email,mail accounts|emailandaccounts",
+            "Family|family,parental|family-group",
+            "Other users|add user,user accounts,guest|otherusers",
+            "Windows Backup|backup,onedrive backup|backup",
+            "Date & time|clock,time zone,date,time|dateandtime",
+            "Language & region|language,region,locale,keyboard layout,input language|regionlanguage",
+            "Speech|voice,speech recognition|speech",
+            "Gaming|game mode,xbox game bar|gaming-gamebar",
+            "Game Mode|gaming|gaming-gamemode",
+            "Captures|game dvr,screen recording,record|gaming-gamedvr",
+            "Accessibility|ease of access,a11y|easeofaccess",
+            "Text size|font size,bigger text|easeofaccess-display",
+            "Mouse pointer and touch|cursor size,pointer color|easeofaccess-mousepointer",
+            "Magnifier|zoom,magnify|easeofaccess-magnifier",
+            "Color filters|colorblind,grayscale|easeofaccess-colorfilter",
+            "Contrast themes|high contrast|easeofaccess-highcontrast",
+            "Narrator|screen reader|easeofaccess-narrator",
+            "Captions|subtitles,live captions|easeofaccess-closedcaptioning",
+            "Keyboard accessibility|sticky keys,filter keys,on-screen keyboard|easeofaccess-keyboard",
+            "Privacy & security|privacy,security,permissions|privacy",
+            "Windows Security|antivirus,defender,firewall,virus|windowsdefender",
+            "Find my device|lost,locate|findmydevice",
+            "For developers|developer mode,sudo,dev|developers",
+            "Location|gps,location services|privacy-location",
+            "Camera permissions|camera,webcam|privacy-webcam",
+            "Microphone permissions|microphone,mic|privacy-microphone",
+            "Diagnostics & feedback|telemetry,diagnostic data|privacy-feedback",
+            "Windows Update|update,updates,patch,upgrade|windowsupdate",
+            "Update history|updates installed|windowsupdate-history",
+            "Advanced update options|active hours,restart options|windowsupdate-options",
+            "Windows Insider Program|insider,preview builds|windowsinsider",
+            "Delivery Optimization|update bandwidth|delivery-optimization",
+            "Graphics|gpu,graphics performance,hardware acceleration|display-advancedgraphics",
+            "Presence sensing|presence|presence",
+            "Nearby sharing|share,nearby|crossdevice",
+            "Settings home|settings|home",
+        };
+
+        public static List<AppEntry> Settings()
+        {
+            var list = new List<AppEntry>();
+            foreach (var line in SettingPages)
+            {
+                var p = line.Split('|');
+                list.Add(new AppEntry { Name = p[0], Keywords = p[1], Path = "ms-settings:" + p[2], Id = "setting:" + p[2], Detail = "Settings", Source = 5 });
+            }
+            return list;
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHCreateItemFromParsingName(string path, IntPtr pbc, [MarshalAs(UnmanagedType.LPStruct)] Guid riid,
+            [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
+        [DllImport("shell32.dll")]
+        static extern int SHGetIDListFromObject([MarshalAs(UnmanagedType.IUnknown)] object punk, out IntPtr ppidl);
+
+        static readonly Guid BHID_EnumItems = new Guid("94f60519-2850-4924-aa5a-d15e84868039");
+
+        // Every item of "All Control Panel Items" (launched by its shell item, like Explorer does). Runs on the scan thread (STA).
+        public static List<AppEntry> ControlPanel(Dictionary<string, ImageSource> iconCache)
+        {
+            var list = new List<AppEntry>();
+            IShellItem folder = null;
+            try
+            {
+                if (SHCreateItemFromParsingName("shell:::{21EC2020-3AEA-1069-A2DD-08002B30309D}", IntPtr.Zero, typeof(IShellItem).GUID, out folder) != 0 || folder == null) return list;
+                IntPtr pEnum;
+                folder.BindToHandler(IntPtr.Zero, BHID_EnumItems, typeof(IEnumShellItems).GUID, out pEnum);
+                var en = (IEnumShellItems)Marshal.GetObjectForIUnknown(pEnum);
+                Marshal.Release(pEnum);
+                IShellItem item; uint fetched;
+                while (en.Next(1, out item, out fetched) == 0 && fetched == 1)
+                {
+                    try
+                    {
+                        IntPtr pn;
+                        item.GetDisplayName(0, out pn);
+                        string name = Marshal.PtrToStringUni(pn); Marshal.FreeCoTaskMem(pn);
+                        item.GetDisplayName(0x80018001, out pn);
+                        string id = Marshal.PtrToStringUni(pn); Marshal.FreeCoTaskMem(pn);
+                        var e = new AppEntry { Name = name, Id = "cpl:" + id, Detail = "Control Panel", Source = 5 };
+                        SHGetIDListFromObject(item, out e.Pidl);
+                        ImageSource ic;
+                        if (iconCache != null && iconCache.TryGetValue(e.Id, out ic)) e.Icon = ic; else e.Icon = Shell.GetIcon(item, Shell.IconPx);
+                        list.Add(e);
+                    }
+                    catch { }
+                    finally { Marshal.ReleaseComObject(item); }
+                }
+                Marshal.ReleaseComObject(en);
+            }
+            catch { }
+            finally { if (folder != null) Marshal.ReleaseComObject(folder); }
+            return list;
+        }
+
+        [DllImport("user32.dll")] static extern bool LockWorkStation();
+        [DllImport("powrprof.dll")] static extern bool SetSuspendState(bool hibernate, bool force, bool wakeupEventsDisabled);
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHEmptyRecycleBin(IntPtr hwnd, string root, uint flags);
+
+        static void Run(string exe, string args)
+        {
+            try { Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = true }); } catch { }
+        }
+
+        // Power and session actions. Strict: only found by exact, prefix or word-start matches, so a typo can't restart the PC.
+        public static List<AppEntry> Actions()
+        {
+            var l = new List<AppEntry>();
+            Func<string, string, string, Action, AppEntry> A = (name, kw, id, act) =>
+                new AppEntry { Name = name, Keywords = kw, Id = "action:" + id, Detail = "Action", Source = 6, Act = act, Strict = true };
+            l.Add(A("Lock", "lock screen,lock pc", "lock", () => LockWorkStation()));
+            l.Add(A("Sleep", "suspend,standby", "sleep", () => SetSuspendState(false, false, false)));
+            l.Add(A("Hibernate", "hibernation", "hibernate", () => SetSuspendState(true, false, false)));
+            l.Add(A("Restart", "reboot,restart pc", "restart", () => Run("shutdown.exe", "/r /t 0")));
+            l.Add(A("Shut down", "shutdown,power off,turn off", "shutdown", () => Run("shutdown.exe", "/s /t 0")));
+            l.Add(A("Sign out", "log out,logout,log off,logoff,sign off", "signout", () => Run("shutdown.exe", "/l")));
+            l.Add(A("Empty Recycle Bin", "recycle bin,trash,empty trash", "emptybin", () => SHEmptyRecycleBin(IntPtr.Zero, null, 0)));   // Windows asks first
+            return l;
+        }
     }
 
     // ---------------------------------------------------------------- categories.txt
@@ -685,6 +1266,7 @@ namespace Tessera
         public string TileSize = "Medium";    // Small, Medium or Large
         public bool ShowTrayIcon;             // off by default: its options are in the footer's right-click menu
         public bool Shadow = true;            // soft drop shadow under the menu
+        public string WebSearch = "https://www.google.com/search?q=%s";   // the search box's last row; %s is the query
 
         public static readonly string[] Sizes = { "Small", "Medium", "Large" };
 
@@ -714,6 +1296,7 @@ namespace Tessera
                     }
                     else if (k.Equals("ShowTrayIcon", StringComparison.OrdinalIgnoreCase)) ShowTrayIcon = v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase);
                     else if (k.Equals("Shadow", StringComparison.OrdinalIgnoreCase)) Shadow = !(v == "0" || v.Equals("false", StringComparison.OrdinalIgnoreCase));
+                    else if (k.Equals("WebSearch", StringComparison.OrdinalIgnoreCase) && v.Contains("%s") && (v.StartsWith("http://") || v.StartsWith("https://"))) WebSearch = v;
                 }
             }
             catch { }
@@ -729,8 +1312,9 @@ namespace Tessera
                     "# TileSize: Small, Medium or Large\r\n" +
                     "# ShowTrayIcon: 1 shows Tessera's icon in the notification area\r\n" +
                     "# Shadow: 1 draws a soft shadow under the menu, 0 turns it off\r\n" +
+                    "# WebSearch: the web search offered as the search box's last row; %s is what you typed\r\n" +
                     "TintAlpha=" + TintAlpha + "\r\nTileSize=" + TileSize + "\r\nShowTrayIcon=" + (ShowTrayIcon ? "1" : "0") +
-                    "\r\nShadow=" + (Shadow ? "1" : "0") + "\r\n");
+                    "\r\nShadow=" + (Shadow ? "1" : "0") + "\r\nWebSearch=" + WebSearch + "\r\n");
             }
             catch { }
         }
@@ -1119,6 +1703,11 @@ namespace Tessera
         List<AppEntry> commands = new List<AppEntry>();      // programs on PATH + App Paths entries, refreshed on every scan
         List<AppEntry> indexHits = new List<AppEntry>();     // results of the last completed Windows Search index query...
         string indexQuery = "";                              // ...and the query they belong to
+        List<AppEntry> docHits = new List<AppEntry>();       // documents and folders from the index for docQuery
+        string docQuery = "";
+        List<AppEntry> controlPanel = new List<AppEntry>();  // Control Panel items, refreshed on every scan
+        readonly List<AppEntry> settingPages = Extras.Settings();
+        readonly List<AppEntry> actions = Extras.Actions();
         volatile int searchGen;
         bool oleWarmed;
         HashSet<string> iconFailed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1456,7 +2045,7 @@ namespace Tessera
             if (scanning) { if (fresh) rescanFresh = true; return; }
             scanning = true;
             var cache = new Dictionary<string, ImageSource>();
-            if (!fresh) foreach (var a in apps) if (a.Icon != null && !cache.ContainsKey(a.Id)) cache[a.Id] = a.Icon;
+            if (!fresh) foreach (var a in apps.Concat(controlPanel)) if (a.Icon != null && !cache.ContainsKey(a.Id)) cache[a.Id] = a.Icon;
             bool warm = !oleWarmed; oleWarmed = true;
             var t = new Thread(() =>
             {
@@ -1464,6 +2053,8 @@ namespace Tessera
                 try { list = Shell.Enumerate(cache); } catch { list = null; }
                 List<AppEntry> cmds;
                 try { cmds = FileSearch.ScanCommands(); } catch { cmds = null; }
+                List<AppEntry> cpl;
+                try { cpl = Extras.ControlPanel(cache); } catch { cpl = null; }
                 Dictionary<string, UsageInfo> usg;
                 try { Usage.Reload(); usg = Usage.Snapshot(); } catch { usg = null; }
                 if (warm) { try { FileSearch.QueryIndex("tessera-warmup", 1); } catch { } }   // loads OLE DB so the first real search isn't slow
@@ -1471,6 +2062,7 @@ namespace Tessera
                 {
                     if (list != null && list.Count > 0) { var old = apps; apps = list; Shell.Free(old); homeDirty = true; }
                     if (cmds != null) commands = cmds;
+                    if (cpl != null && cpl.Count > 0) { var oldC = controlPanel; controlPanel = cpl; Shell.Free(oldC); }
                     if (usg != null) usage = usg;
                     lastScan = DateTime.Now; scanning = false;
                     if (rescanFresh) { rescanFresh = false; Scan(true, true); }
@@ -1664,7 +2256,19 @@ namespace Tessera
             catch { }
         }
 
-        void Run(AppEntry a, bool admin) { NoteLaunch(a); HideMenu(); if (a.Path != null) FileSearch.Launch(a, admin); else Shell.Launch(a, admin); }
+        void Run(AppEntry a, bool admin)
+        {
+            if (view == "search" && a.Source != 7 && a.Source != 4)
+            {
+                string q = search.Text.Trim(), key = a.Path ?? a.Id;
+                if (a.Source != 6 || a.Strict) { var t = new Thread(() => Picks.Record(q, key)) { IsBackground = true }; t.Start(); }
+            }
+            if (a.Source != 7 && !(a.Source == 6 && !a.Strict)) NoteLaunch(a);
+            HideMenu();
+            if (a.Act != null) { var act = a.Act; Dispatcher.BeginInvoke(new Action(() => { try { act(); } catch { } }), DispatcherPriority.Background); }
+            else if (a.Path != null) FileSearch.Launch(a, admin);
+            else Shell.Launch(a, admin);
+        }
 
         // ------------------------------------------------ layout
         void BuildShell()
@@ -2185,15 +2789,7 @@ namespace Tessera
         class SearchHit { public AppEntry E; public int S; }
 
         // 0 exact (with or without extension), 1 prefix, 2 word start, 3 contains, -1 no match
-        static int Score(string name, string q)
-        {
-            if (name.Equals(q, StringComparison.OrdinalIgnoreCase) || FileSearch.StripExt(name).Equals(q, StringComparison.OrdinalIgnoreCase)) return 0;
-            if (name.StartsWith(q, StringComparison.OrdinalIgnoreCase)) return 1;
-            if (name.IndexOf(" " + q, StringComparison.OrdinalIgnoreCase) >= 0 || name.IndexOf("-" + q, StringComparison.OrdinalIgnoreCase) >= 0
-                || name.IndexOf("_" + q, StringComparison.OrdinalIgnoreCase) >= 0 || name.IndexOf("." + q, StringComparison.OrdinalIgnoreCase) >= 0) return 2;
-            if (name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) return 3;
-            return -1;
-        }
+        static int Score(string name, string q) { return Matcher.Score(name, q); }
 
         // lowercase, letters and digits only, without a trailing "desktop" or "app"
         static string NormName(string s)
@@ -2207,7 +2803,40 @@ namespace Tessera
             return r;
         }
 
-        static double h_rank(SearchHit h, double use) { return h.S + (h.E.Path != null ? 0.5 : 0) - use; }
+        Dictionary<string, double> pickBonus = new Dictionary<string, double>();   // Picks for the query being shown
+
+        // tier, then a nudge by kind (apps first, power actions last), minus how much you use it and pick it for this query
+        double h_rank(SearchHit h, double use)
+        {
+            var e = h.E;
+            double kind = e.Source == 0 ? 0 : e.Source == 5 ? (e.Path != null ? 0.6 : 0.8) : e.Source == 6 ? 1.0 : 0.5;
+            double pick;
+            string key = (e.Path ?? e.Id ?? "").ToLowerInvariant();
+            if (!pickBonus.TryGetValue(key, out pick)) pick = 0;
+            return h.S + kind - use - pick;
+        }
+
+        TextBlock Glyph(string glyph, double size)
+        {
+            return new TextBlock { Text = glyph, FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), FontSize = size * 0.75,
+                Width = size, Height = size, TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Center, Padding = new Thickness(0, size * 0.1, 0, 0), Foreground = Brushes.White };
+        }
+
+        static string GlyphFor(AppEntry a)
+        {
+            if (a.Source == 7) return "";                      // search
+            if (a.Id == "calc") return "";                     // calculator
+            switch (a.Id)
+            {
+                case "action:lock": return "";
+                case "action:sleep": return "";
+                case "action:hibernate": return "";
+                case "action:restart": return "";
+                case "action:emptybin": return "";
+                default: return "";                            // power
+            }
+        }
 
         static int SourceOrder(int src) { return src == 1 ? 0 : src == 2 ? 1 : src == 3 ? 2 : 3; }
 
@@ -2237,6 +2866,20 @@ namespace Tessera
                 int s = Score(a.Name, q);
                 if (s >= 0) appHits.Add(new SearchHit { E = a, S = s });
             }
+            // settings pages, Control Panel items and power actions, ranked with the apps; one row per name
+            var appNames = new HashSet<string>();
+            foreach (var h in appHits) appNames.Add(NormName(h.E.Name));
+            foreach (var a in settingPages.Concat(controlPanel).Concat(actions))
+            {
+                int s = Matcher.ScoreWithKeywords(a, q);
+                if (s < 0 || !appNames.Add(NormName(a.Name))) continue;
+                appHits.Add(new SearchHit { E = a, S = s });
+            }
+            // fuzzy and typo matches only when the close ones are few, so they never crowd out real hits
+            int close = appHits.Count(h => h.S <= Matcher.Contains);
+            if (close >= 3) appHits.RemoveAll(h => h.S >= Matcher.Typo);
+            if (close >= 6) appHits.RemoveAll(h => h.S >= Matcher.Fuzzy);
+            pickBonus = Picks.Bonuses(q);
             var fileHits = new List<SearchHit>();
             foreach (var c in commands)
             {
@@ -2310,27 +2953,65 @@ namespace Tessera
             foreach (var x in ranked.OrderBy(x => x.Key).ThenBy(x => x.Value.E.Name).Take(8)) all.Add(x.Value);
             var orderedHits = new List<KeyValuePair<double, SearchHit>>();
             foreach (var h in all) orderedHits.Add(new KeyValuePair<double, SearchHit>(h_rank(h, UsageOf(h.E)), h));
-            var ordered = orderedHits.OrderBy(x => x.Key).ThenBy(x => x.Value.E.Name).Take(typed != null ? 39 : 40).Select(x => x.Value.E).ToList();
+            var ordered = orderedHits.OrderBy(x => x.Key).ThenBy(x => x.Value.E.Name).Take(typed != null ? 29 : 30).Select(x => x.Value.E).ToList();
             if (typed != null) ordered.Insert(0, typed);
+
+            // calculator answer goes first: typing "12*7" means you want 84, not an app with 12 in its name
+            string answer = Calc.TryEval(q);
+            if (answer != null)
+            {
+                string copy = answer.Replace(",", "");
+                ordered.Insert(0, new AppEntry { Name = "= " + answer, Id = "calc", Detail = "Enter copies it", Source = 6,
+                    Act = () => { try { Clipboard.SetText(copy); } catch { } } });
+            }
+
+            // documents and folders from the index, in their own section (newest first)
+            var docs = new List<AppEntry>();
+            if (q.Length >= 3 && docQuery.Length > 0 && (docQuery == q || q.StartsWith(docQuery, StringComparison.OrdinalIgnoreCase)))
+            {
+                var words = q.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var d in docHits)
+                {
+                    if (seenPaths.Contains(d.Path)) continue;
+                    bool every = true;
+                    foreach (var w in words) if (d.Name.IndexOf(w, StringComparison.OrdinalIgnoreCase) < 0) { every = false; break; }
+                    if (every) docs.Add(d);
+                }
+                docs = docs.OrderByDescending(d => UsageOf(d)).Take(6).ToList();
+            }
+            int docStart = ordered.Count;
+            ordered.AddRange(docs);
+
+            // and always a way out: search the web for it
+            string url = (Set != null ? Set.WebSearch : "https://www.google.com/search?q=%s").Replace("%s", Uri.EscapeDataString(q));
+            string host = "the web";
+            try { host = new Uri(url).Host; if (host.StartsWith("www.")) host = host.Substring(4); } catch { }
+            int webAt = ordered.Count;
+            ordered.Add(new AppEntry { Name = "Search the web for \"" + q + "\"", Id = "web", Detail = host, Source = 7,
+                Act = () => Shell.LaunchFile(url, null, false) });
+
             results = ordered;
-            foreach (var a in results) if (a.Path != null && a.Icon == null) a.Icon = FileSearch.Cached(a.Path);
+            foreach (var a in results) if (a.Path != null && a.Icon == null) a.Icon = FileSearch.Cached(FileSearch.IconSource(a.Path));
 
             var sp = new StackPanel { Margin = new Thickness(Pad - 4, 0, Pad - 10, 12) };
-            sp.Children.Add(Header(results.Count == 0 ? "Nothing matches \"" + q + "\"" : "Best matches", null, null));
+            sp.Children.Add(Header(webAt == 0 ? "Nothing on this PC matches \"" + q + "\"" : "Best matches", null, null));
             resultRows.Clear();
-            foreach (var a in results)
+            for (int ri = 0; ri < results.Count; ri++)
             {
+                var a = results[ri];
+                if (ri == docStart && docs.Count > 0) sp.Children.Add(Header("Files & folders", null, null));
                 var r = new Border { Height = 46, CornerRadius = new CornerRadius(6), Background = Clear, Padding = new Thickness(12, 0, 14, 0) };
                 var rg = new Grid();
-                var ic = Icon(a, 26); ic.HorizontalAlignment = HorizontalAlignment.Left;
-                rg.Children.Add(ic);
-                rg.Children.Add(new TextBlock { Text = a.Name, FontSize = 13.5, Margin = new Thickness(42, 0, 120, 0), VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
-                rg.Children.Add(new TextBlock { Text = a.Path != null ? a.Detail : CategoryOf(a), FontSize = 12, Foreground = Fg3, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center });
+                if (a.Icon == null && (a.Source == 6 || a.Source == 7)) rg.Children.Add(Glyph(GlyphFor(a), 26));
+                else { var ic = Icon(a, 26); ic.HorizontalAlignment = HorizontalAlignment.Left; rg.Children.Add(ic); }
+                rg.Children.Add(new TextBlock { Text = a.Name, FontSize = 13.5, Margin = new Thickness(42, 0, 140, 0), VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
+                rg.Children.Add(new TextBlock { Text = a.Path != null || a.Source >= 5 ? a.Detail : CategoryOf(a), FontSize = 12, Foreground = Fg3, MaxWidth = 130, TextTrimming = TextTrimming.CharacterEllipsis, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center });
                 r.Child = rg;
                 var idx = resultRows.Count;
                 r.MouseEnter += (s, e) => Select(idx);
                 r.MouseLeftButtonUp += (s, e) => Run(a, false);
-                if (a.Path != null) { r.ToolTip = a.Path; r.ContextMenu = FileMenu(a); }
+                if (a.Source >= 5 && a.Source <= 7) { if (a.Path != null) r.ToolTip = a.Path; }
+                else if (a.Path != null) { r.ToolTip = a.Path; r.ContextMenu = FileMenu(a); }
                 else r.ContextMenu = AppMenu(a);
                 resultRows.Add(r); sp.Children.Add(r);
             }
@@ -2344,31 +3025,41 @@ namespace Tessera
             // background pass: ask the Windows Search index for files and fetch icons of file results
             int gen = ++searchGen;
             bool needIndex = indexQuery != q && q.Length >= 2;
+            bool needDocs = docQuery != q && q.Length >= 3 && answer == null;
             var need = new List<AppEntry>();
             foreach (var a in results) if (a.Path != null && a.Icon == null && !iconFailed.Contains(a.Path)) need.Add(a);
-            if (needIndex || need.Count > 0) StartSearchPass(q, gen, needIndex, need);
+            if (needIndex || needDocs || need.Count > 0) StartSearchPass(q, gen, needIndex, needDocs, need);
         }
 
-        void StartSearchPass(string q, int gen, bool needIndex, List<AppEntry> need)
+        void StartSearchPass(string q, int gen, bool needIndex, bool needDocs, List<AppEntry> need)
         {
             var t = new Thread(() =>
             {
-                List<AppEntry> hits = null;
-                if (needIndex)
+                List<AppEntry> hits = null, docs = null;
+                if (needIndex || needDocs)
                 {
                     Thread.Sleep(120);   // let typing settle
                     if (gen != searchGen) return;
+                }
+                if (needIndex)
+                {
                     hits = FileSearch.QueryIndex(q, 30);
+                    if (gen != searchGen) return;
+                }
+                if (needDocs)
+                {
+                    docs = FileSearch.QueryDocs(q, 8);
                     if (gen != searchGen) return;
                 }
                 var todo = new List<AppEntry>(need);
                 if (hits != null) todo.AddRange(hits);
+                if (docs != null) todo.AddRange(docs);
                 var failed = new List<string>();
                 foreach (var e in todo)
                 {
                     if (gen != searchGen) return;
                     if (e.Icon != null) continue;
-                    var ic = FileSearch.Icon(e.Path);
+                    var ic = FileSearch.Icon(FileSearch.IconSource(e.Path));
                     if (ic != null) e.Icon = ic; else failed.Add(e.Path);
                 }
                 Dispatcher.BeginInvoke(new Action(() =>
@@ -2376,6 +3067,7 @@ namespace Tessera
                     foreach (var f in failed) iconFailed.Add(f);
                     if (gen != searchGen || view != "search" || search.Text.Trim() != q) return;
                     if (hits != null) { indexQuery = q; indexHits = hits; }
+                    if (docs != null) { docQuery = q; docHits = docs; }
                     ShowSearch(q, true);
                 }));
             });

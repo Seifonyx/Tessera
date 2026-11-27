@@ -1,4 +1,4 @@
-# Tessera categories. Each [Section] is a category card, in this order.
+﻿# Tessera categories. Each [Section] is a category card, in this order.
 # List apps by the name shown in the menu (or by AppID when two apps share a name).
 # [Pinned] is the top row, [Hidden] is never shown. Apps not listed anywhere go to "Other".
 
@@ -17,9 +17,9 @@ Fart Together Demo
 Worst Class Ever Demo
 Mortuus Demo
 Steam
+Clutch
 Epic Games Launcher
 Game Bar
-Gaming Mode
 
 [Internet & Chat]
 Brave
@@ -84,7 +84,6 @@ TinyTask
 BlurAutoClicker
 
 [PC Tools]
-Process Explorer
 Autoruns
 Revo Uninstaller
 TreeSize Free
@@ -93,7 +92,6 @@ WinAuth
 Lenovo Vantage
 AMD Software
 Pre-boot Manager
-Apps Folder (C-Apps)
 
 [Development]
 Terminal
@@ -178,3 +176,4 @@ Windows PowerShell ISE 5.1
 Windows PowerShell ISE 5.1 (x86)
 
 [Hidden]
+Gaming Mode

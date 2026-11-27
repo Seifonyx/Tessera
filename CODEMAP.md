@@ -9,7 +9,7 @@ Read this before searching code. Update it when files are added, moved or remove
 - `Tessera.ico`, `make-icon.ps1` - app icon and its generator.
 - `categories.txt` - user-defined category tiles and their apps.
 - `settings.ini` - user settings (written by the settings page).
-- `usage.txt` - launch counts for ranking (gitignored).
+- `usage.txt` - launch counts for ranking (gitignored). `picks.txt` - learned search picks (gitignored).
 - `install-mod.cmd`, `install-mod.ps1` - install the Windhawk mod.
 - `tessera-start-button.wh.cpp` - Windhawk mod that redirects the Start button to Tessera.
 - `README.md` - user-facing overview. `HANDOFF.md` - long-form working context.
@@ -19,6 +19,10 @@ Read this before searching code. Update it when files are added, moved or remove
 - `AppEntry` - one launchable app/shortcut.
 - `Shell` - Start-menu/app enumeration and launching helpers.
 - `FileSearch` - Windows Search / PATH / App Paths file lookup for the search box.
+- `Matcher` - search match tiers (exact, prefix, word start, initials, any-order words, contains, fuzzy, typo).
+- `Picks` - learns which result you launch for each typed query (picks.txt, gitignored).
+- `Calc` - calculator answers in the search box.
+- `Extras` - Settings pages catalog, Control Panel items, power actions (lock, sleep, restart...).
 - `UsageInfo`, `Usage` - launch-frequency tracking.
 - `BitTools` - small bit helpers.
 - `Category`, `Config` - categories.txt model and loader.
